@@ -35,6 +35,9 @@ tests = defaultMain $ do
             [ testCase "Plain URL" . assert $
                 urlVerifyDomain "example.com" "http://example.com/"
 
+            , testCase "Case sensitivity" . assert $
+                urlVerifyDomain "example.com" "https://eXaMpLe.CoM/"
+
             , testCase "HTTPS" . assert $
                 urlVerifyDomain "example.com" "https://example.com/"
 
@@ -71,9 +74,7 @@ main = do
         print txt
         putChar '\t'
         parseTest robotParser txt
-        putChar '\t'
-        print $ ezParser txt
-    parseTest domainParser "http://example.com/"
+    parseTest uriParser "http://example.com/"
 
     tests
 

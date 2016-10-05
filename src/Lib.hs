@@ -19,7 +19,7 @@ import Control.Concurrent.STM.TVar
 -- Helpful control structure functions for dealing with nested data
 import Control.Lens
 -- Helpful control structure functions
-import Control.Monad (forM_, void, forever)
+import Control.Monad (forM_, void, forever, when, guard, unless)
 
 -- Efficient textual parser
 import qualified Data.Attoparsec.Text as Atto
@@ -31,6 +31,8 @@ import qualified Data.ByteString.Lazy as BL
 -- Case insensitive text
 import Data.CaseInsensitive (CI)
 import qualified Data.CaseInsensitive as CI
+-- Function utilities
+import Data.Function (on)
 -- List utilities
 import qualified Data.List as List
 -- Key/value map data structure
@@ -50,13 +52,15 @@ import Data.Vector (Vector)
 import qualified Data.Vector as Vec
 
 -- Wreq is for HTTP requests
-import qualified Network.Wreq.Session as Wreq
 import qualified Network.Wreq as Wreq (responseBody, defaults, header)
+import qualified Network.Wreq.Session as Wreq
+import qualified Network.Wreq.Types as Wreq
 
 -- Safe(r) paths; we use this for URL construction
-import System.FilePath.Posix ((</>))
+import System.FilePath.Posix ((</>), dropDrive)
 -- "Unsafe" IO functions; only used safely here
 import System.IO.Unsafe (unsafePerformIO)
+import System.Exit (exitSuccess)
 
 -- XML parser
 import qualified Text.Taggy as Taggy hiding (htmlWith)
@@ -64,111 +68,134 @@ import qualified Text.Taggy.Lens as Taggy
 -- }}}
 
 
--- The Blackbird compose function
--- f `blackbird` g where g takes two arguments instead of one.
-blackbird = ( . ) . ( . )
+-- URLs are just Strings
+type URL = String
 
-
--- Simple data structure for Robots.txt rules
+-- | Data structure for Robots.txt rules
 data RobotRules = RobotUserAgent Text
                 | RobotDisallowed Text
                 | RobotIgnored
                 deriving (Show, Eq)
 
+-- | URI data structure
+data URI = URI { uriProtocol :: Text
+               , uriUserinfo :: Text
+               , uriDomain :: Text
+               , uriPort :: Text
+               , uriPath :: Text
+               }
+               deriving (Show)
+
+-- | Crawler config data structure
+data Config = Config { confDisPaths :: [Text]
+                     , confDomain :: Text
+                     }
+
+
+logger = unsafePerformIO newTQueueIO
+logPrint a = mapM_ ($ a) [atomically . writeTQueue logger . show]
+
+
+-- | Visited link cache and frequency
+linkCache :: TVar (Map Text Int)
+linkCache = unsafePerformIO $ newTVarIO $ Map.fromList [("/",1),("",1)]
+
+-- | Unvisited link queue
+linkQueue :: TQueue Text
+linkQueue = unsafePerformIO newTQueueIO
+
+
+-- | Parser for robots.txt files
+robotParser :: Atto.Parser [RobotRules]
 robotParser = do
+    -- Parse a list of user agents, disallowed paths, and ignored content
     Atto.many' $ Atto.choice [ userAgent
                              , disallowed
                              , comment
                              ]
   where
     userAgent = spaceAround $ do
+        -- Case-insensitive match
         Atto.asciiCI "User-Agent:"
+        -- Ignore following spaces
         Atto.skipWhile (== ' ')
+        -- Take until newline and return the user agent
         RobotUserAgent <$> (Atto.takeWhile1 (/= '\n') <|> pure "")
     disallowed = spaceAround $ do
+        -- Case-insensitive match
         Atto.asciiCI "Disallow:"
+        -- Ignore following spaces
         Atto.skipWhile (== ' ')
+        -- Take until newline and return the disallowed path
         RobotDisallowed <$> (Atto.takeWhile1 (/= '\n') <|> pure "")
     comment = spaceAround $ do
+        -- Comments start with hashes
         Atto.char '#'
+        -- Take until a newline is reached
         !comment <- Atto.takeWhile1 (/= '\n') <|> pure ""
+        -- Just return ignored content constructor
         return RobotIgnored
+    -- Skip many spaces or newlines
     whiteSpace = Atto.skipWhile (`elem` [' ', '\n']) <|> pure ()
+    -- Combinator: one parser surrounded by another parser
     surround p0 p1 = p0 *> p1 <* p0
+    -- A parser surrounded by whitespace
     spaceAround = surround whiteSpace
 
-ezParser = map toRobotData
-         -- Remove empty lines
-         . filter (/= "")
-         -- Remove comment lines
-         . filter (not . Text.isPrefixOf "#")
-         -- Split on lines
-         . Text.lines
-         -- Remove spaces
-         . Text.filter (/= ' ')
-  where
-    toRobotData x = case () of
-      _ | isPrefixOfCIText "User-Agent:" x ->
-            RobotUserAgent $ Text.drop 11 x
-
-        | isPrefixOfCIText "Disallow:" x ->
-            RobotDisallowed $ Text.drop 9 x
-
-        | otherwise -> RobotIgnored
-
-    isPrefixOfCIText x y = CI.mk (Text.take (Text.length x) y) == CI.mk x
-
 -- | Parser to obtain domain given an URL
-domainParser :: Atto.Parser (CI Text)
-domainParser = do
-    -- Protocol
-    Atto.choice [ Atto.string "http:"
-                , Atto.string "https:"
-                -- Consume nothing and continue
-                , pure ""
-                ]
-    -- Separator
-    Atto.string "//"
-    -- User/password
-    Atto.choice [ Atto.takeWhile1 uriUserInfo >> Atto.char '@'
-                -- Consume nothing and continue
-                , pure ' '
-                ]
-    -- Domain
-    domain <- CI.mk <$> Atto.takeWhile1 uriRegName
-    -- Port
-    Atto.choice [ Atto.char ':' >> Atto.takeWhile1 isDigit
-                , pure ""
-                ]
-    -- Path
-    Atto.choice [ Atto.char '/' >> Atto.takeText >> Atto.endOfInput
-                , Atto.char '/' >> Atto.endOfInput
-                , Atto.endOfInput
-                ]
-
-    return domain
+uriParser :: Atto.Parser URI
+uriParser = URI <$> protocol <* separator <*> userinfo <*> domain
+                   <*> port <*> path
   where
+    protocol = do
+        Atto.choice [ Atto.string "http:"
+                    , Atto.string "https:"
+                    -- Consume nothing and continue
+                    , pure ""
+                    ]
+    separator = Atto.string "//"
+    userinfo = do
+        Atto.choice [ Atto.takeWhile1 isUserInfo <* Atto.char '@'
+                    -- Consume nothing and continue
+                    , pure ""
+                    ]
+    domain = Atto.takeWhile1 isRegName
+    port = do
+        Atto.choice [ Atto.char ':' >> Atto.takeWhile1 isDigit
+                    , pure ""
+                    ]
+    path = do
+        Atto.choice [ Atto.char '/' >> Atto.takeWhile1 (/= '#')
+                    , Atto.string "/"
+                    , pure ""
+                    ]
+    -- Helpers
     isDigit c = c >= '0' && c <= '9'
     isAlpha c = c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z'
     -- Allowed characters in a URI's reg-name ABNF
-    uriRegName :: Char -> Bool
-    uriRegName c = or [ isAlpha c
-                      , isDigit c
-                      , elem c ("-._~%!$&'()*+,;=" :: String)
-                      ]
+    isRegName :: Char -> Bool
+    isRegName c = or [ isAlpha c
+                     , isDigit c
+                     , elem c ("-._~%!$&'()*+,;=" :: String)
+                     ]
     -- Allowed characters in a URI's userinfo ABNF
-    uriUserInfo :: Char -> Bool
-    uriUserInfo c = uriRegName c || c == ':'
+    isUserInfo :: Char -> Bool
+    isUserInfo c = isRegName c || c == ':'
+
+-- | Parse a domain from an URL into a Maybe
+maybeParseURI :: Text -> Maybe URI
+maybeParseURI url = Atto.maybeResult
+                  $ Atto.parse uriParser url `Atto.feed` ""
+
+-- | Verify that a URI contains the specified domain
+uriVerifyDomain :: Text -> URI -> Bool
+uriVerifyDomain domain uri = on (==) CI.mk domain $ uriDomain uri
 
 -- | Verify that a URL is of a specific domain
 urlVerifyDomain :: Text -> Text -> Bool
-urlVerifyDomain domain url = maybe False (CI.mk domain ==)
-                           $ maybeParseDomain url
-
--- | Parse a domain from an URL into a Maybe
-maybeParseDomain :: Text -> Maybe (CI Text)
-maybeParseDomain url = Atto.maybeResult
-                     $ Atto.parse domainParser url `Atto.feed` ""
+urlVerifyDomain domain = maybe False id
+                       . fmap (uriVerifyDomain domain)
+                       . maybeParseURI
 
 
 -- | Download and parse HTML into contained hyperlinks
@@ -190,16 +217,17 @@ getPageLinks session url = do
 
     return links
 
--- Make the crawler identifiable with a unique User-Agent
-opts = Wreq.defaults
+noExceptions _ _ _ = Nothing
+
+    -- Don't throw exceptions on HTTP codes
+opts = Wreq.defaults { Wreq.checkStatus = Just noExceptions }
+    -- Make the crawler identifiable with a unique User-Agent
      & set (Wreq.header "User-Agent") ["milk-biscuit-teacake"]
 
--- TODO
 -- | Download and return robots.txt disallows
 getRobotRules :: Wreq.Session -> URL -> IO [RobotRules]
 getRobotRules session host = do
     let url = host </> "robots.txt"
-    print url
     request <- Wreq.getWith opts session url
 
     let body :: BL.ByteString
@@ -208,102 +236,106 @@ getRobotRules session host = do
         textBody :: Text
         textBody = Text.decodeUtf8With Text.lenientDecode (BL.toStrict body)
 
+              -- Filter ignored lines
     let rules = filter (/= RobotIgnored)
+              -- Default to empty list on failure
               . maybe [] id . Atto.maybeResult
+              -- Parse the robots.txt file
               $ Atto.parse robotParser textBody `Atto.feed` ""
 
     return rules
 
-linkCache :: TVar (Map Text Int)
-linkCache = unsafePerformIO $ newTVarIO Map.empty
+crawl :: Wreq.Session -> URL -> Config -> IO ()
+crawl session url config = do
+    let disallowedPaths = confDisPaths config
+        domain = confDomain config
 
-linkQueue :: TQueue String
-linkQueue = unsafePerformIO $ newTQueueIO
-
--- TODO
-crawl :: Wreq.Session -> URL -> IO ()
-crawl session url = do
-    robotRules <- getRobotRules session url
-
-    print robotRules
-
-    let disallowedPaths = do
-            -- Filter non-RobotDisallowed
-            RobotDisallowed x <- robotRules
-            return x
-
+    -- Scrape the page for links
     links <- getPageLinks session url
 
-    print links
-
-    let allowedLinks = List.deleteFirstsBy
-                       (not `blackbird` Text.isPrefixOf)
-                       disallowedPaths
-                       links
-
-    print allowedLinks
-
+    -- Get visited links from the cache
     visitedLinks <- Map.keys <$> readTVarIO linkCache
 
-    -- Filter visited links
-    let unvisitedLinks = List.deleteFirstsBy (/=) visitedLinks allowedLinks
-        unvisitedMap = Map.fromList $ map (,1) unvisitedLinks
+    -- Remove duplicates
+    let uniqueLinks = List.nub links
 
-    print unvisitedLinks
+    -- Sanitised paths
+    let paths = do
+            -- For each link
+            link <- uniqueLinks
+            -- Parse link to Maybe URI
+            let muri = maybeParseURI link
+            -- Verify domain; assume no domain on parse failure
+            guard $ maybe True id $ uriVerifyDomain domain <$> muri
+            -- Remove fragment from link
+            let noFragmentLink = Text.takeWhile (/= '#') link
+            -- Use link as path instead of uriPath on parse failure
+            let path = maybe noFragmentLink uriPath muri
+            -- No disallowed paths
+            guard . not $ any (`Text.isPrefixOf` path) disallowedPaths
+            -- No visited paths
+            guard . not $ any (== path) visitedLinks
+            return path
 
-    atomically $ modifyTVar' linkCache $ \cacheMap ->
-        Map.unionWith (+) cacheMap unvisitedMap
+    let pathsMap = Map.fromList $ map (,1) paths
 
-    atomically $ mapM_ (writeTQueue linkQueue . Text.unpack) unvisitedLinks
+    atomically $ do
+        -- Count link frequency
+        modifyTVar' linkCache $ flip (Map.unionWith (+)) pathsMap
 
-    return ()
-
-
--- TODO concurrently re-use sessions!
---      - How many?
---          - As many as there are scraped links
---              - max (length links) (length sessions)
---          - Maybe there's a website limit
---      - Can we store sessions for re-use?
---      - Use `linkQueue` with `sessionHandler`, when one finishes
---        just keep reading the queue forever until exhausted.
---          - How do we spread the workload evenly across GET requests?
---              - Configurable command line argument?
-
-sessionPool :: TVar (Vector Wreq.Session)
-sessionPool = unsafePerformIO $ newTVarIO Vec.empty
-
-type URL = String
-
--- | 
-sessionHandler :: IO ()
-                 -- No-cookie HTTP sessions
-sessionHandler = Wreq.withAPISession $ \session -> do
-    forever $ do
-        url <- atomically $ readTQueue linkQueue
-        print url
-        crawl session url
-    atomically $ putTMVar finishedState () -- FIXME this is just a trick
+        -- Queue unvisited links
+        mapM_ (writeTQueue linkQueue) paths
 
 
-finishedState = unsafePerformIO $ newEmptyTMVarIO
+-- | Re-use HTTP session to crawl
+sessionHandler :: URL -> Config -> IO ()
+sessionHandler homepage config = do
+    -- No-cookie HTTP sessions
+    Wreq.withAPISession $ \session -> forever $ do
+        path <- atomically $ Text.unpack <$> readTQueue linkQueue
+        let url = homepage </> dropDrive path
+        logPrint url
+        crawl session url config
 
 -- | Initialise the crawler with concurrent sessionHandlers
 initCrawler :: URL -> IO ()
 initCrawler url = do
-    let mdom = maybeParseDomain $ Text.pack url
+    let domain = maybe "" uriDomain . maybeParseURI $ Text.pack url
 
-    -- Get initial, homepage links
-    Wreq.withAPISession (`crawl` url)
+    -- Get initial homepage links, and robots.txt disallowed paths
+    config <- Wreq.withAPISession $ \session -> do
+        robotRules <- getRobotRules session url
+
+        let !disallowedPaths = do
+                -- Filter non-RobotDisallowed
+                RobotDisallowed (!x) <- robotRules
+                return x
+
+        let config = Config disallowedPaths domain
+
+        crawl session url config
+
+        return config
 
     -- Run sessionHandlers in separate threads
-    forM_ [1 .. 6] $ const (forkIO sessionHandler)
+    forM_ [1 .. 6] $ const (forkIO $ sessionHandler url config)
 
-    -- Block until we're finished
-    atomically $ takeTMVar finishedState
+    let keyboardLoop = getLine >>= \s -> unless (s == "q") keyboardLoop
+
+    keyboardLoop
+    print =<< readTVarIO linkCache
+
+    -- Exit program
+    exitSuccess
+
 
 initProgram :: [URL] -> IO ()
 initProgram urls = do
+    -- Logging/debugging
+    writeFile "log" ""
+    forkIO $ forever $ do
+        s <- atomically $ readTQueue logger
+        appendFile "log" (s ++ "\n")
     -- For each website
     forM_ urls initCrawler
 
