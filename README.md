@@ -8,6 +8,8 @@ You need Stack to install this Haskell program.
 
 Once you're in the the project git directory, run `stack install`.
 
+You can run the tests with `stack build --test` and the benchmark with `stack build --bench`.
+
 ## Run
 
 The program simply takes a list of homepage URLs to crawl as a command-line argument.

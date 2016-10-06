@@ -10,7 +10,7 @@ module Lib where
 -- Helpful control structure function for failure/choice
 import Control.Applicative ((<|>))
 -- Concurrency
-import Control.Concurrent (forkIO)
+import Control.Concurrent (forkIO, myThreadId, ThreadId)
 -- Mutable shared state
 import Control.Concurrent.STM (atomically)
 import Control.Concurrent.STM.TMVar
@@ -20,6 +20,7 @@ import Control.Concurrent.STM.TVar
 import Control.Lens
 -- Helpful control structure functions
 import Control.Monad (forM_, void, forever, when, guard, unless)
+import qualified Control.Monad.STM as STM (retry)
 
 -- Efficient textual parser
 import qualified Data.Attoparsec.Text as Atto
@@ -103,6 +104,9 @@ linkCache = unsafePerformIO $ newTVarIO $ Map.fromList [("/",1),("",1)]
 -- | Unvisited link queue
 linkQueue :: TQueue Text
 linkQueue = unsafePerformIO newTQueueIO
+
+threadDoneCache :: TVar (Vector ThreadId)
+threadDoneCache = unsafePerformIO $ newTVarIO Vec.empty
 
 
 -- | Parser for robots.txt files
@@ -197,10 +201,9 @@ urlVerifyDomain domain = maybe False id
                        . fmap (uriVerifyDomain domain)
                        . maybeParseURI
 
-
--- | Download and parse HTML into contained hyperlinks
-getPageLinks :: Wreq.Session -> URL -> IO [Text]
-getPageLinks session url = do
+-- | Download a webpage and return the parsed contents
+getPage :: Wreq.Session -> URL -> IO (Maybe Taggy.Node)
+getPage session url = do
     request <- Wreq.getWith opts session url
 
     let body :: LazyText.Text
@@ -209,13 +212,33 @@ getPageLinks session url = do
                         -- Lenient UTF-8 decoding to Text
                         . to (LazyText.decodeUtf8With Text.lenientDecode)
 
+    return $ body ^? Taggy.htmlWith False
+
+
+-- | Parse HTML into contained hyperlinks
+getPageLinks :: Taggy.Node -> IO [Text]
+getPageLinks node = do
                 -- Remove those without href attributes
     let links = catMaybes $ do
             -- Find all <a> tags with href attributes
-            body ^.. Taggy.htmlWith False . Taggy.allNamed (only "a")
-                   . Taggy.attr "href"
+            node ^.. Taggy.allNamed (only "a") . Taggy.attr "href"
 
     return links
+
+-- | Parse HTML into contained asset links
+getPageAssets :: Taggy.Node -> IO [Text]
+getPageAssets node = do
+    let imgs = catMaybes $ do
+            node ^.. Taggy.allNamed (only "img") . Taggy.attr "src"
+        scripts = catMaybes $ do
+            node ^.. Taggy.allNamed (only "script") . Taggy.attr "src"
+        styles = catMaybes $ do
+            node ^.. Taggy.allNamed (only "link")
+                   . Taggy.attributed (ix "rel" . only "text/css")
+                   . Taggy.attr "href"
+
+    return undefined
+
 
 noExceptions _ _ _ = Nothing
 
@@ -250,8 +273,14 @@ crawl session url config = do
     let disallowedPaths = confDisPaths config
         domain = confDomain config
 
-    -- Scrape the page for links
-    links <- getPageLinks session url
+    -- Download page
+    mnode <- getPage session url
+
+    -- Get page links; return empty list on getPage parse failure
+    links <- maybe (pure []) getPageLinks mnode
+
+    -- Get page assets; return empty list on getPage parse failure
+    assets <- maybe (pure []) getPageAssets mnode
 
     -- Get visited links from the cache
     visitedLinks <- Map.keys <$> readTVarIO linkCache
@@ -279,6 +308,8 @@ crawl session url config = do
 
     let pathsMap = Map.fromList $ map (,1) paths
 
+    tid <- myThreadId
+
     atomically $ do
         -- Count link frequency
         modifyTVar' linkCache $ flip (Map.unionWith (+)) pathsMap
@@ -286,15 +317,24 @@ crawl session url config = do
         -- Queue unvisited links
         mapM_ (writeTQueue linkQueue) paths
 
+        -- No unvisited links; thread finished?
+        modifyTVar' threadDoneCache (Vec.cons tid)
+
 
 -- | Re-use HTTP session to crawl
 sessionHandler :: URL -> Config -> IO ()
 sessionHandler homepage config = do
     -- No-cookie HTTP sessions
     Wreq.withAPISession $ \session -> forever $ do
+        -- Read next link
         path <- atomically $ Text.unpack <$> readTQueue linkQueue
+        -- Thread unfinished; remove done status
+        tid <- myThreadId
+        atomically $ modifyTVar' threadDoneCache (Vec.filter (/= tid))
+        -- Safely combine homepage and path to a URL
         let url = homepage </> dropDrive path
         logPrint url
+        -- Crawl page for more links
         crawl session url config
 
 -- | Initialise the crawler with concurrent sessionHandlers
@@ -320,10 +360,30 @@ initCrawler url = do
     -- Run sessionHandlers in separate threads
     forM_ [1 .. 6] $ const (forkIO $ sessionHandler url config)
 
-    let keyboardLoop = getLine >>= \s -> unless (s == "q") keyboardLoop
+    dones <- atomically $ do
+        dones <- readTVar threadDoneCache
+        -- All threads are currently done, we may be finished
+        if Vec.length dones == 6 then do
+            isEmptyLinkQueue <- isEmptyTQueue linkQueue
+            -- When the link queue is empty, we're done; otherwise retry
+            unless isEmptyLinkQueue STM.retry
 
-    keyboardLoop
-    print =<< readTVarIO linkCache
+        -- Only some threads are done; retry
+        else STM.retry
+
+        return dones
+
+    putStrLn "Finished."
+    putChar '\t'
+    putStr $ "Dones: " ++ show (Vec.length dones)
+    putChar ' ' >> putStrLn (show dones)
+    linkMap <- readTVarIO linkCache
+    putChar '\t'
+    putStrLn $ "URLs crawled: " ++ show (Map.size linkMap - 1)
+    putChar '\t'
+    putStrLn $ "Total links: " ++ show (sum $ Map.elems linkMap)
+    putChar '\t'
+    putStrLn $ "Total links length: " ++ show (Text.length . mconcat $ Map.keys linkMap)
 
     -- Exit program
     exitSuccess
