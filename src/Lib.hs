@@ -64,7 +64,7 @@ import qualified Network.Wreq.Types as Wreq
 
 -- Safe(r) paths; we use this for URL construction
 import System.FilePath.Posix ((</>), dropDrive)
--- "Unsafe" IO functions; only used safely here
+-- "Unsafe" IO functions; only used safely here!
 import System.IO.Unsafe (unsafePerformIO)
 import System.Exit (exitSuccess)
 
@@ -154,8 +154,7 @@ data Args = Args { argsThreads :: Int
 
 -- {{{ Shared state
 
--- Map (visited URL) (list (and thus frequency) of visitor URL)
--- | Visited link cache and frequency
+-- | Visited link cache
 linkCache :: TVar (Set Text)
 linkCache = unsafePerformIO $ newTVarIO Set.empty
 
@@ -344,7 +343,6 @@ crawl session url config = do
     -- Get page assets; return empty assets on getPage parse failure
     assets <- maybe (pure emptyAssets) getPageAssets mnode
 
-    -- Links: first element of assets tuple
     let links = view _1 assets
         imgs = view _2 assets
         scripts = view _3 assets
@@ -381,7 +379,7 @@ crawl session url config = do
     tid <- myThreadId
 
     atomically $ do
-        -- Count link frequency
+        -- Paths that we've already seen and queued
         modifyTVar' linkCache $ flip Set.union pathsSet
 
         let mergeSubAsset ot nt = nt & _1 +~ (view _1 ot)

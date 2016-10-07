@@ -16,6 +16,10 @@ The program simply takes a list of homepage URLs to crawl as a command-line argu
 
 `crawler 'http://example.com/'`
 
+## Design
+
+[DESIGN.md](DESIGN.md)
+
 ## License
 
 BSD3. See the LICENSE file for more information.
