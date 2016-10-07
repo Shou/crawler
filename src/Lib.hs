@@ -12,19 +12,19 @@ import Control.Applicative ((<|>))
 -- Concurrency
 import Control.Concurrent (forkIO, myThreadId, ThreadId)
 -- Mutable shared state
+import Control.Concurrent.MVar
+-- Non-blocking mutable shared state
 import Control.Concurrent.STM (atomically)
-import Control.Concurrent.STM.TMVar
 import Control.Concurrent.STM.TQueue
 import Control.Concurrent.STM.TVar
 -- Helpful control structure functions for dealing with nested data
 import Control.Lens
 -- Helpful control structure functions
-import Control.Monad (forM_, void, forever, when, guard, unless)
+import Control.Monad (forM, forM_, forever, guard, unless)
 import qualified Control.Monad.STM as STM (retry)
 
 -- Efficient textual parser
 import qualified Data.Attoparsec.Text as Atto
-import qualified Data.Attoparsec.Combinator as Atto
 -- Efficient, low-level String
 import qualified Data.ByteString as BS
 -- Lazily evaluated ByteString
@@ -41,6 +41,9 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 -- Safe failures
 import Data.Maybe (catMaybes)
+-- Sets
+import Data.Set (Set)
+import qualified Data.Set as Set
 -- Efficient UTF8 String
 import Data.Text (Text)
 import qualified Data.Text.Lazy as LazyText (Text)
@@ -48,6 +51,8 @@ import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text (decodeUtf8With)
 import qualified Data.Text.Encoding.Error as Text (lenientDecode)
 import qualified Data.Text.Lazy.Encoding as LazyText (decodeUtf8With)
+-- Time utilities
+import Data.Time (getCurrentTime, diffUTCTime)
 -- Vector: efficient arrays
 import Data.Vector (Vector)
 import qualified Data.Vector as Vec
@@ -69,8 +74,45 @@ import qualified Text.Taggy.Lens as Taggy
 -- }}}
 
 
+-- {{{ Data and types
+
+-- Assets is just a 4-tuple with Text lists
+type Assets = ([Text], [Text], [Text], [Text])
+
 -- URLs are just Strings
 type URL = String
+
+data AssetType = Link Text
+               | Img Text
+               | Script Text
+               | Style Text
+               deriving (Ord)
+
+-- | Ignore the constructor
+instance Eq AssetType where
+    t1 == t2 = fromAssetType t1 == fromAssetType t2
+
+fromAssetType :: AssetType -> Text
+fromAssetType (Link t) = t
+fromAssetType (Img t) = t
+fromAssetType (Script t) = t
+fromAssetType (Style t) = t
+
+isLink :: AssetType -> Bool
+isLink (Link _) = True
+isLink _ = False
+
+isImg :: AssetType -> Bool
+isImg (Img _) = True
+isImg _ = False
+
+isScript :: AssetType -> Bool
+isScript (Script _) = True
+isScript _ = False
+
+isStyle :: AssetType -> Bool
+isStyle (Style _) = True
+isStyle _ = False
 
 -- | Data structure for Robots.txt rules
 data RobotRules = RobotUserAgent Text
@@ -87,27 +129,48 @@ data URI = URI { uriProtocol :: Text
                }
                deriving (Show)
 
+type AssetMap = Map AssetType (Int, Vector Text)
+
 -- | Crawler config data structure
-data Config = Config { confDisPaths :: [Text]
-                     , confDomain :: Text
-                     }
+data Config =
+    Config { confDisPaths :: [Text]
+           -- ^ Disallowed paths
+           , confDomain :: Text
+           -- ^ Website domain
+           , confAssetCache :: TVar AssetMap
+           -- ^ Static assets, and their associated visitor URLs and frequency
+           }
+
+-- Used in Main
+-- | Command line arguments data structure
+data Args = Args { argsThreads :: Int
+                 -- ^ Amount of threads
+                 , argsURLs :: [String]
+                 -- ^ Websites to crawl
+                 }
+
+-- }}}
 
 
-logger = unsafePerformIO newTQueueIO
-logPrint a = mapM_ ($ a) [atomically . writeTQueue logger . show]
+-- {{{ Shared state
 
-
+-- Map (visited URL) (list (and thus frequency) of visitor URL)
 -- | Visited link cache and frequency
-linkCache :: TVar (Map Text Int)
-linkCache = unsafePerformIO $ newTVarIO $ Map.fromList [("/",1),("",1)]
+linkCache :: TVar (Set Text)
+linkCache = unsafePerformIO $ newTVarIO Set.empty
 
 -- | Unvisited link queue
 linkQueue :: TQueue Text
 linkQueue = unsafePerformIO newTQueueIO
 
+-- | Quantity of finished threads
 threadDoneCache :: TVar (Vector ThreadId)
 threadDoneCache = unsafePerformIO $ newTVarIO Vec.empty
 
+-- }}}
+
+
+-- {{{ Parsers
 
 -- | Parser for robots.txt files
 robotParser :: Atto.Parser [RobotRules]
@@ -201,6 +264,11 @@ urlVerifyDomain domain = maybe False id
                        . fmap (uriVerifyDomain domain)
                        . maybeParseURI
 
+-- }}}
+
+
+-- {{{ Web utils
+
 -- | Download a webpage and return the parsed contents
 getPage :: Wreq.Session -> URL -> IO (Maybe Taggy.Node)
 getPage session url = do
@@ -214,30 +282,25 @@ getPage session url = do
 
     return $ body ^? Taggy.htmlWith False
 
-
--- | Parse HTML into contained hyperlinks
-getPageLinks :: Taggy.Node -> IO [Text]
-getPageLinks node = do
-                -- Remove those without href attributes
-    let links = catMaybes $ do
-            -- Find all <a> tags with href attributes
-            node ^.. Taggy.allNamed (only "a") . Taggy.attr "href"
-
-    return links
-
 -- | Parse HTML into contained asset links
-getPageAssets :: Taggy.Node -> IO [Text]
+getPageAssets :: Taggy.Node -> IO Assets
 getPageAssets node = do
-    let imgs = catMaybes $ do
+        -- Find all <a> and return href attributes
+    let !links = catMaybes $ do
+            node ^.. Taggy.allNamed (only "a") . Taggy.attr "href"
+        -- Find all <img> and return src attributes
+        !imgs = catMaybes $ do
             node ^.. Taggy.allNamed (only "img") . Taggy.attr "src"
-        scripts = catMaybes $ do
+        -- Find all <script> and return src attributes
+        !scripts = catMaybes $ do
             node ^.. Taggy.allNamed (only "script") . Taggy.attr "src"
-        styles = catMaybes $ do
+        -- Find all <link rel="stylesheet"> and return href attributes
+        !styles = catMaybes $ do
             node ^.. Taggy.allNamed (only "link")
-                   . Taggy.attributed (ix "rel" . only "text/css")
+                   . Taggy.attributed (ix "rel" . only "stylesheet")
                    . Taggy.attr "href"
 
-    return undefined
+    return (links, imgs, scripts, styles)
 
 
 noExceptions _ _ _ = Nothing
@@ -272,18 +335,23 @@ crawl :: Wreq.Session -> URL -> Config -> IO ()
 crawl session url config = do
     let disallowedPaths = confDisPaths config
         domain = confDomain config
+        assetCache = confAssetCache config
 
     -- Download page
     mnode <- getPage session url
 
-    -- Get page links; return empty list on getPage parse failure
-    links <- maybe (pure []) getPageLinks mnode
+    let emptyAssets = ([], [], [], [])
+    -- Get page assets; return empty assets on getPage parse failure
+    assets <- maybe (pure emptyAssets) getPageAssets mnode
 
-    -- Get page assets; return empty list on getPage parse failure
-    assets <- maybe (pure []) getPageAssets mnode
+    -- Links: first element of assets tuple
+    let links = view _1 assets
+        imgs = view _2 assets
+        scripts = view _3 assets
+        styles = view _4 assets
 
     -- Get visited links from the cache
-    visitedLinks <- Map.keys <$> readTVarIO linkCache
+    visitedLinks <- readTVarIO linkCache
 
     -- Remove duplicates
     let uniqueLinks = List.nub links
@@ -293,31 +361,46 @@ crawl session url config = do
             -- For each link
             link <- uniqueLinks
             -- Parse link to Maybe URI
-            let muri = maybeParseURI link
+            let !muri = maybeParseURI link
             -- Verify domain; assume no domain on parse failure
             guard $ maybe True id $ uriVerifyDomain domain <$> muri
             -- Remove fragment from link
             let noFragmentLink = Text.takeWhile (/= '#') link
             -- Use link as path instead of uriPath on parse failure
             let path = maybe noFragmentLink uriPath muri
-            -- No disallowed paths
+            -- Filter disallowed paths
             guard . not $ any (`Text.isPrefixOf` path) disallowedPaths
-            -- No visited paths
-            guard . not $ any (== path) visitedLinks
+            -- Filter visited paths
+            guard . not $ Set.member path visitedLinks
+            -- Filter root aliases
+            guard $ path `notElem` ["/", ""]
             return path
 
-    let pathsMap = Map.fromList $ map (,1) paths
+    let pathsSet = Set.fromList paths
 
     tid <- myThreadId
 
     atomically $ do
         -- Count link frequency
-        modifyTVar' linkCache $ flip (Map.unionWith (+)) pathsMap
+        modifyTVar' linkCache $ flip Set.union pathsSet
+
+        let mergeSubAsset ot nt = nt & _1 +~ (view _1 ot)
+                                     & _2 <>~ (view _2 ot)
+        let mergeAsset :: (Text -> AssetType) -> [Text] -> AssetMap
+                       -> AssetMap
+            mergeAsset c ts = Map.unionWith mergeSubAsset
+                            $ Map.fromList
+                            $ map ((,(1, Vec.singleton $ Text.pack url)) . c) ts
+        -- Add assets
+        modifyTVar' assetCache $ mergeAsset Link links
+        modifyTVar' assetCache $ mergeAsset Img imgs
+        modifyTVar' assetCache $ mergeAsset Script scripts
+        modifyTVar' assetCache $ mergeAsset Style styles
 
         -- Queue unvisited links
         mapM_ (writeTQueue linkQueue) paths
 
-        -- No unvisited links; thread finished?
+        -- Work finished
         modifyTVar' threadDoneCache (Vec.cons tid)
 
 
@@ -333,17 +416,23 @@ sessionHandler homepage config = do
         atomically $ modifyTVar' threadDoneCache (Vec.filter (/= tid))
         -- Safely combine homepage and path to a URL
         let url = homepage </> dropDrive path
-        logPrint url
         -- Crawl page for more links
         crawl session url config
 
+-- }}}
+
+
 -- | Initialise the crawler with concurrent sessionHandlers
-initCrawler :: URL -> IO ()
-initCrawler url = do
+initCrawler :: Int -> URL -> IO ()
+initCrawler threadCount !url = do
+    putStrLn $ "Crawling \"" ++ url ++ "\"..."
+
+    !startTime <- getCurrentTime
+
     let domain = maybe "" uriDomain . maybeParseURI $ Text.pack url
 
     -- Get initial homepage links, and robots.txt disallowed paths
-    config <- Wreq.withAPISession $ \session -> do
+    configs <- Wreq.withAPISession $ \session -> do
         robotRules <- getRobotRules session url
 
         let !disallowedPaths = do
@@ -351,19 +440,23 @@ initCrawler url = do
                 RobotDisallowed (!x) <- robotRules
                 return x
 
-        let config = Config disallowedPaths domain
+        configs <- forM [1 .. threadCount] $ const $ do
+            assetCache <- newTVarIO Map.empty
+            return $ Config disallowedPaths domain assetCache
 
-        crawl session url config
+        case configs of
+            (config:_) -> crawl session url config
+            _ -> putStrLn "No threads."
 
-        return config
+        return configs
 
     -- Run sessionHandlers in separate threads
-    forM_ [1 .. 6] $ const (forkIO $ sessionHandler url config)
+    forM_ configs $ forkIO . sessionHandler url
 
     dones <- atomically $ do
         dones <- readTVar threadDoneCache
         -- All threads are currently done, we may be finished
-        if Vec.length dones == 6 then do
+        if Vec.length dones == threadCount then do
             isEmptyLinkQueue <- isEmptyTQueue linkQueue
             -- When the link queue is empty, we're done; otherwise retry
             unless isEmptyLinkQueue STM.retry
@@ -373,29 +466,42 @@ initCrawler url = do
 
         return dones
 
-    putStrLn "Finished."
+    let mergeSubAsset ot nt = nt & _1 +~ (view _1 ot)
+                                 & _2 <>~ (view _2 ot)
+    allAssets <- fmap (Map.unionsWith mergeSubAsset)
+              . forM configs $ readTVarIO . confAssetCache
+
+    -- Print basic stats
+    putStrLn $ "Finished with \"" ++ url ++ "\"."
     putChar '\t'
-    putStr $ "Dones: " ++ show (Vec.length dones)
+    putStr $ "Done threads: " ++ show (Vec.length dones)
     putChar ' ' >> putStrLn (show dones)
-    linkMap <- readTVarIO linkCache
     putChar '\t'
-    putStrLn $ "URLs crawled: " ++ show (Map.size linkMap - 1)
+    linkSet <- readTVarIO linkCache
+    putStrLn $ "URLs crawled: " ++ show (Set.size linkSet)
     putChar '\t'
-    putStrLn $ "Total links: " ++ show (sum $ Map.elems linkMap)
+    let links = filter isLink $ Map.keys allAssets
+    putStrLn $ "Asset links: " ++ show (length links)
     putChar '\t'
-    putStrLn $ "Total links length: " ++ show (Text.length . mconcat $ Map.keys linkMap)
+    let imgs = filter isImg $ Map.keys allAssets
+    putStrLn $ "Asset imgs: " ++ show (length imgs)
+    putChar '\t'
+    let scripts = filter isScript $ Map.keys allAssets
+    putStrLn $ "Asset scripts: " ++ show (length scripts)
+    putChar '\t'
+    let styles = filter isStyle $ Map.keys allAssets
+    putStrLn $ "Asset styles: " ++ show (length styles)
+    putChar '\t'
+    endTime <- getCurrentTime
+    putStrLn $ "Time elapsed: " ++ show (diffUTCTime endTime startTime)
 
     -- Exit program
     exitSuccess
 
-
-initProgram :: [URL] -> IO ()
-initProgram urls = do
-    -- Logging/debugging
-    writeFile "log" ""
-    forkIO $ forever $ do
-        s <- atomically $ readTQueue logger
-        appendFile "log" (s ++ "\n")
+initProgram :: Args -> IO ()
+initProgram args = do
+    let urls = argsURLs args
+        threadCount = argsThreads args
     -- For each website
-    forM_ urls initCrawler
+    forM_ urls $ initCrawler threadCount
 
