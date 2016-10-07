@@ -1,5 +1,5 @@
 
-This is a concurrent Haskell website crawler.
+### A concurrent Haskell website crawler.
 
 ## Install
 
@@ -12,9 +12,13 @@ You can run the tests with `stack build --test` and the benchmark with `stack bu
 
 ## Run
 
-The program simply takes a list of homepage URLs to crawl as a command-line argument.
+The program takes a list of homepage URLs to crawl as a command-line argument.
 
 `crawler 'http://example.com/'`
+
+Optionally you can specify the amount of threads to use.
+
+`crawler -t 10 'http://example.com/'`
 
 ## Design
 

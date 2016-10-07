@@ -1,8 +1,11 @@
 
-{-# LANGUAGE OverloadedStrings, TypeApplications, PartialTypeSignatures,
-             TupleSections, BangPatterns
+-- Language extensions to enable
+
+{-# LANGUAGE OverloadedStrings, TypeApplications,
+             PartialTypeSignatures, TupleSections, BangPatterns
 #-}
 
+-- Module name
 module Lib where
 
 
@@ -20,7 +23,7 @@ import Control.Concurrent.STM.TVar
 -- Helpful control structure functions for dealing with nested data
 import Control.Lens
 -- Helpful control structure functions
-import Control.Monad (forM, forM_, forever, guard, unless)
+import Control.Monad (forM, forM_, forever, guard, unless, join)
 import qualified Control.Monad.STM as STM (retry)
 
 -- Efficient textual parser
@@ -41,6 +44,8 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 -- Safe failures
 import Data.Maybe (catMaybes)
+-- Monoids: appendable data structures
+import Data.Monoid ((<>))
 -- Sets
 import Data.Set (Set)
 import qualified Data.Set as Set
@@ -48,6 +53,7 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text.Lazy as LazyText (Text)
 import qualified Data.Text as Text
+import qualified Data.Text.IO as Text
 import qualified Data.Text.Encoding as Text (decodeUtf8With)
 import qualified Data.Text.Encoding.Error as Text (lenientDecode)
 import qualified Data.Text.Lazy.Encoding as LazyText (decodeUtf8With)
@@ -86,7 +92,7 @@ data AssetType = Link Text
                | Img Text
                | Script Text
                | Style Text
-               deriving (Ord)
+               deriving (Ord, Show)
 
 -- | Ignore the constructor
 instance Eq AssetType where
@@ -129,7 +135,14 @@ data URI = URI { uriProtocol :: Text
                }
                deriving (Show)
 
-type AssetMap = Map AssetType (Int, Vector Text)
+type AssetMap = Map Text (Map AssetType Int)
+
+mergeSubAssets :: Map AssetType Int -> Map AssetType Int
+               -> Map AssetType Int
+mergeSubAssets = Map.unionWith (+)
+
+insertAssets :: Text -> Map AssetType Int -> AssetMap -> AssetMap
+insertAssets = Map.insertWith mergeSubAssets
 
 -- | Crawler config data structure
 data Config =
@@ -211,7 +224,7 @@ robotParser = do
 -- | Parser to obtain domain given an URL
 uriParser :: Atto.Parser URI
 uriParser = URI <$> protocol <* separator <*> userinfo <*> domain
-                   <*> port <*> path
+                <*> port <*> path
   where
     protocol = do
         Atto.choice [ Atto.string "http:"
@@ -355,45 +368,49 @@ crawl session url config = do
     let uniqueLinks = List.nub links
 
     -- Sanitised paths
-    let paths = do
+    let sanitiseLinks allowVisited ls = do
             -- For each link
-            link <- uniqueLinks
+            !link <- ls
             -- Parse link to Maybe URI
             let !muri = maybeParseURI link
             -- Verify domain; assume no domain on parse failure
             guard $ maybe True id $ uriVerifyDomain domain <$> muri
             -- Remove fragment from link
-            let noFragmentLink = Text.takeWhile (/= '#') link
+            let !noFragmentLink = Text.takeWhile (/= '#') link
             -- Use link as path instead of uriPath on parse failure
-            let path = maybe noFragmentLink uriPath muri
+            let !path = maybe noFragmentLink uriPath muri
             -- Filter disallowed paths
             guard . not $ any (`Text.isPrefixOf` path) disallowedPaths
+            -- Should we filter visited paths?
+            if not allowVisited
             -- Filter visited paths
-            guard . not $ Set.member path visitedLinks
-            -- Filter root aliases
-            guard $ path `notElem` ["/", ""]
+            then guard . not $ Set.member path visitedLinks
+            -- Do nothing
+            else pure ()
             return path
+
+    let !paths = sanitiseLinks False links
 
     let pathsSet = Set.fromList paths
 
     tid <- myThreadId
 
     atomically $ do
-        -- Paths that we've already seen and queued
-        modifyTVar' linkCache $ flip Set.union pathsSet
-
-        let mergeSubAsset ot nt = nt & _1 +~ (view _1 ot)
-                                     & _2 <>~ (view _2 ot)
-        let mergeAsset :: (Text -> AssetType) -> [Text] -> AssetMap
-                       -> AssetMap
-            mergeAsset c ts = Map.unionWith mergeSubAsset
-                            $ Map.fromList
-                            $ map ((,(1, Vec.singleton $ Text.pack url)) . c) ts
+        let merger :: (Text -> AssetType) -> [Text] -> AssetMap
+                   -> AssetMap
+            merger c = insertAssets (Text.pack url)
+                     . List.foldl' (\m k -> Map.insertWith (+) (c k) 1 m)
+                                   Map.empty
+                     . sanitiseLinks True
         -- Add assets
-        modifyTVar' assetCache $ mergeAsset Link links
-        modifyTVar' assetCache $ mergeAsset Img imgs
-        modifyTVar' assetCache $ mergeAsset Script scripts
-        modifyTVar' assetCache $ mergeAsset Style styles
+        modifyTVar' assetCache $ merger Link links
+        modifyTVar' assetCache $ merger Img imgs
+        modifyTVar' assetCache $ merger Script scripts
+        modifyTVar' assetCache $ merger Style styles
+
+    atomically $ do
+        -- Add paths that we've seen and will queue
+        modifyTVar' linkCache $ flip Set.union pathsSet
 
         -- Queue unvisited links
         mapM_ (writeTQueue linkQueue) paths
@@ -420,11 +437,28 @@ sessionHandler homepage config = do
 -- }}}
 
 
+-- | Write the sitemap to a formatted text file
+writeSiteMap :: Text -> AssetMap -> IO ()
+writeSiteMap domain assetMap = do
+    let formatSub prevText asset freq = mconcat
+            [ prevText, "\tFrequency: ", Text.pack (show freq)
+            , ";\tAsset: ", Text.pack $ show asset, "\n"
+            ]
+        format prevText url subMap = mconcat
+            [prevText, url, "\n", showSubMap subMap, "\n"]
+
+        showSubMap = Map.foldlWithKey formatSub ""
+        showMap = Map.foldlWithKey format "" assetMap
+
+    Text.writeFile (Text.unpack domain) showMap
+
+
 -- | Initialise the crawler with concurrent sessionHandlers
 initCrawler :: Int -> URL -> IO ()
-initCrawler threadCount !url = do
+initCrawler threadCount url = do
     putStrLn $ "Crawling \"" ++ url ++ "\"..."
 
+    -- Start time
     !startTime <- getCurrentTime
 
     let domain = maybe "" uriDomain . maybeParseURI $ Text.pack url
@@ -451,6 +485,7 @@ initCrawler threadCount !url = do
     -- Run sessionHandlers in separate threads
     forM_ configs $ forkIO . sessionHandler url
 
+    -- Done threads list
     dones <- atomically $ do
         dones <- readTVar threadDoneCache
         -- All threads are currently done, we may be finished
@@ -464,10 +499,14 @@ initCrawler threadCount !url = do
 
         return dones
 
-    let mergeSubAsset ot nt = nt & _1 +~ (view _1 ot)
-                                 & _2 <>~ (view _2 ot)
-    allAssets <- fmap (Map.unionsWith mergeSubAsset)
+    !httpTime <- getCurrentTime
+
+    -- Collect assets from threads' shared state
+    allAssets <- fmap (Map.unionsWith mergeSubAssets)
               . forM configs $ readTVarIO . confAssetCache
+
+    -- Write site map
+    writeSiteMap domain allAssets
 
     -- Print basic stats
     putStrLn $ "Finished with \"" ++ url ++ "\"."
@@ -478,20 +517,28 @@ initCrawler threadCount !url = do
     linkSet <- readTVarIO linkCache
     putStrLn $ "URLs crawled: " ++ show (Set.size linkSet)
     putChar '\t'
-    let links = filter isLink $ Map.keys allAssets
-    putStrLn $ "Asset links: " ++ show (length links)
+    let links = filter isLink . List.nub . join . Map.elems
+              $ Map.map Map.keys allAssets
+    putStrLn $ "Unique asset links: " ++ show (length links)
     putChar '\t'
-    let imgs = filter isImg $ Map.keys allAssets
-    putStrLn $ "Asset imgs: " ++ show (length imgs)
+    let imgs = filter isImg . List.nub . join . Map.elems
+             $ Map.map Map.keys allAssets
+    putStrLn $ "Unique asset imgs: " ++ show (length imgs)
     putChar '\t'
-    let scripts = filter isScript $ Map.keys allAssets
-    putStrLn $ "Asset scripts: " ++ show (length scripts)
+    let scripts = filter isScript . List.nub . join . Map.elems
+                $ Map.map Map.keys allAssets
+    putStrLn $ "Unique asset scripts: " ++ show (length scripts)
     putChar '\t'
-    let styles = filter isStyle $ Map.keys allAssets
-    putStrLn $ "Asset styles: " ++ show (length styles)
+    let styles = filter isStyle . List.nub . join . Map.elems
+               $ Map.map Map.keys allAssets
+    putStrLn $ "Unique asset styles: " ++ show (length styles)
     putChar '\t'
     endTime <- getCurrentTime
-    putStrLn $ "Time elapsed: " ++ show (diffUTCTime endTime startTime)
+    putStrLn $ "Time elapsed (HTTP): " ++ show (diffUTCTime httpTime startTime)
+    putChar '\t'
+    endTime <- getCurrentTime
+    putStrLn $ "Time elapsed (total): " ++ show (diffUTCTime endTime startTime)
+    putStrLn $ "Sitemap file: " ++ Text.unpack domain
 
     -- Exit program
     exitSuccess
