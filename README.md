@@ -8,7 +8,7 @@ You need Stack to install this Haskell program.
 
 Once you're in the the project git directory, run `stack install`.
 
-You can run the tests with `stack build --test` and the benchmark with `stack build --bench`.
+You can run the small tests with `stack build --test`.
 
 ## Run
 

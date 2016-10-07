@@ -2,7 +2,9 @@
 Overall I'm quite happy with how nicely concurrent the program is.
 
 Some things I'm not quite so content with on the other hand, are that one,
-it could be faster, and two, it's using a lot of memory. There are some parts
+it could be faster and more efficient on a per-thread basis, and two, it's
+using a lot of memory.
+There are some parts
 of the program where instead of writing a smaller modular function that takes
 part of processed data I instead just write one bigger and re-run it over data
 wholly. An example of this is `sanitiseLinks` which resides inside the body of
@@ -12,16 +14,19 @@ split that off and filter visited links afterwards, because there is a parser
 being run within which should be more expensive than simply recursing over the
 structure again.
 
-As for the memory usage, there is a space-leak somewhere in the program hasn't
-been found, as it can be seen growing to gigabytes of memory
-usage in some instances. Considering the data stored should only be in kilobytes
-or megabytes;
-the throughput coming from the HTTP requests is of course much more but this
+As for the memory usage, there is a space-leak somewhere in the program that hasn't
+been found, as it can be seen growing to a gigabyte of memory
+usage in some instances. I conclude this by considering the data stored should
+only be in kilobytes or megabytes.
+The throughput coming from the HTTP requests is of course much more but this
 should result in a relatively flat, and not increasing, memory usage in theory.
+The profiling tools seem to back this up too, showing that a large chunk of
+memory is used on the Text datatype, used throughout the program, especially
+by the parsers and filter functions within `crawl`.
 
-I'm using a Dell XPS 13 (9350) laptop to run the program. My Internet speed is
-approximately 30 Mbps down and upload capped at 2 Mbps. With this, my results
-are as follows.
+I'm using a Dell XPS 13 (9350) laptop with a dual-core Intel i5-6200U CPU to
+run the program. My Internet speed is approximately 30 Mbps down and upload
+capped at 2 Mbps. With this, my results are as follows.
 
 ```sh
 $ crawler -t 1 'http://gocardless.com/'
@@ -42,10 +47,20 @@ $ crawler -t 2 'http://gocardless.com/'
         Time elapsed (HTTP): 171.0120849s
         Time elapsed (total): 178.4599005s
 
+$ crawler -t 4 'http://gocardless.com/'
+...
+        Time elapsed (HTTP): 83.2007034s
+        Time elapsed (total): 90.7026613s
+
 $ crawler -t 6 'http://gocardless.com/'
 ...
         Time elapsed (HTTP): 80.7108952s
         Time elapsed (total): 99.5526153s
+
+$ crawler -t 8 'http://gocardless.com/'
+...
+        Time elapsed (HTTP): 71.5850902s
+        Time elapsed (total): 78.8504494s
 
 $ crawler -t 10 'http://gocardless.com/'
 ...
@@ -69,7 +84,18 @@ $ crawler -t 64 'http://gocardless.com/'
 
 ```
 
-The benefit of more threads seems to taper off logarithmically.
+The benefit of more threads seems to taper off somewhat logarithmically, with
+an interestingly larger decrease at ten threads compared to the preceding.
+
+As for test-cases, I only had the time to write tests for my written URL parser,
+which was important to ensure correctness for.
+
+I have to note here that there
+is a slight inconsistency in how many URLs are downloaded, with what seems
+like an error rate of +/-10 in the worst case, being liberal. Usually it's only
+off by one. I'm not sure why but by diffing the page list we may be able to
+figure it out; whether it's a bug in the program itself, or maybe something on
+the site changing.
 
 # Project structure
 
@@ -96,6 +122,7 @@ Some unit tests have been written for the URL parser.
 # Concurrency
 
 State Transactional Memory is used in order to avoid worry about deadlocks.
+Each thread is a synchronous HTTP downloader, HTML parser, and link filterer.
 
 ### Shared state
 
@@ -135,13 +162,13 @@ queue.
 
 ### Robot.txt
 
-The combinator parsing library `attoparsec` was used to write a parser
+The combinator parsing library `attoparsec` was used to write a parser `robotParser`
 following the format of `robots.txt` files, in order to obtain the disallowed
 paths.
 
 ### URLs
 
-The combinator parsing library `attoparsec` was used to write a parser
+The combinator parsing library `attoparsec` was used to write a parser `uriParser`
 mostly following the URL spec. Each part of the URL is stored in a
 data-structure for easy access to e.g. just the domain, or path.
 
