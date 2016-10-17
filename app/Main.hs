@@ -28,7 +28,7 @@ parserOpts = info (helper <*> argsParser) $
 main :: IO ()
 main = do
     -- Flush stdout after newlines
-    hSetBuffering stdout LineBuffering
+    hSetBuffering stdout NoBuffering
     -- Run program with specified command-line arguments
     execParser parserOpts >>= initProgram
 

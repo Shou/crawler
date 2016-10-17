@@ -7,6 +7,7 @@ import Test.Tasty
 import Test.Tasty.HUnit
 
 import qualified Data.Attoparsec.Text as Atto
+import qualified Data.Map.Strict as Map
 
 
 parseFeed p t = Atto.parse p t `Atto.feed` ""
@@ -25,8 +26,22 @@ sampleRobotsTxts =
 
 tests = defaultMain $ do
     testGroup "Tests"
-        [ testGroup "Empty"
-            [
+        [ testGroup "URI path parser unit tests"
+            [ testCase "Plain path" . assert $
+                maybe False (== URIPath "/api/v3/noun" Map.empty) $
+                    maybeParseURIPath "/api/v3/noun"
+
+            , testCase "Plain GET arguments" . assert $
+                maybe False (== URIPath "" (Map.fromList [("a", "b"),("c","d")])) $
+                    maybeParseURIPath "?a=b&c=d"
+
+            , testCase "Path and GET" . assert $
+                maybe False (== URIPath "/api/v3/noun" (Map.fromList [("a", "b"),("c","d")])) $
+                    maybeParseURIPath "/api/v3/noun?a=b&c=d"
+
+            , testCase "Empty path" . assert $
+                maybe False (== URIPath "" Map.empty) $
+                    maybeParseURIPath ""
             ]
 
         -- Wikipedia specifies an URI's syntax to be of the format:

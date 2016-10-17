@@ -2,7 +2,8 @@
 -- Language extensions to enable
 
 {-# LANGUAGE OverloadedStrings, TypeApplications,
-             PartialTypeSignatures, TupleSections, BangPatterns
+             PartialTypeSignatures, TupleSections, BangPatterns,
+             GADTs, RankNTypes, DeriveGeneric, DeriveAnyClass
 #-}
 
 -- Module name
@@ -20,10 +21,17 @@ import Control.Concurrent.MVar
 import Control.Concurrent.STM (atomically)
 import Control.Concurrent.STM.TQueue
 import Control.Concurrent.STM.TVar
+-- Deep seq
+import Control.DeepSeq
+-- Exception handling
+import Control.Exception (try, SomeException)
 -- Helpful control structure functions for dealing with nested data
 import Control.Lens
 -- Helpful control structure functions
-import Control.Monad (forM, forM_, forever, guard, unless, join)
+import Control.Monad ( forM, forM_, forever, guard, unless, join
+                     , when
+                     )
+import Control.Monad.IO.Class (liftIO)
 import qualified Control.Monad.STM as STM (retry)
 
 -- Efficient textual parser
@@ -32,9 +40,17 @@ import qualified Data.Attoparsec.Text as Atto
 import qualified Data.ByteString as BS
 -- Lazily evaluated ByteString
 import qualified Data.ByteString.Lazy as BL
+-- Boolean utilities
+import Data.Bool (bool)
 -- Case insensitive text
 import Data.CaseInsensitive (CI)
 import qualified Data.CaseInsensitive as CI
+-- Safe type-coercion
+import Data.Coerce (coerce)
+-- Conduit
+import Data.Conduit
+import qualified Data.Conduit.Combinators as CC
+import Data.Conduit.TQueue
 -- Function utilities
 import Data.Function (on)
 -- List utilities
@@ -49,6 +65,7 @@ import Data.Monoid ((<>))
 -- Sets
 import Data.Set (Set)
 import qualified Data.Set as Set
+import Data.Tagged (Tagged(..))
 -- Efficient UTF8 String
 import Data.Text (Text)
 import qualified Data.Text.Lazy as LazyText (Text)
@@ -62,6 +79,9 @@ import Data.Time (getCurrentTime, diffUTCTime)
 -- Vector: efficient arrays
 import Data.Vector (Vector)
 import qualified Data.Vector as Vec
+
+-- Generic data
+import GHC.Generics (Generic)
 
 -- Wreq is for HTTP requests
 import qualified Network.Wreq as Wreq (responseBody, defaults, header)
@@ -82,41 +102,50 @@ import qualified Text.Taggy.Lens as Taggy
 
 -- {{{ Data and types
 
--- Assets is just a 4-tuple with Text lists
-type Assets = ([Text], [Text], [Text], [Text])
-
 -- URLs are just Strings
 type URL = String
 
-data AssetType = Link Text
-               | Img Text
-               | Script Text
-               | Style Text
-               deriving (Ord, Show)
+data Asset = Link Text
+           | Img Text
+           | Script Text
+           | Style Text
+           deriving (Ord, Show, Generic, NFData)
+
+newtype AssetOf tag = AssetOf Asset
+
+data Link
+data Allowed
+data Unvisited
+data Stripped
 
 -- | Ignore the constructor
-instance Eq AssetType where
-    t1 == t2 = fromAssetType t1 == fromAssetType t2
+instance Eq Asset where
+    t1 == t2 = fromAsset t1 == fromAsset t2
 
-fromAssetType :: AssetType -> Text
-fromAssetType (Link t) = t
-fromAssetType (Img t) = t
-fromAssetType (Script t) = t
-fromAssetType (Style t) = t
+mapAsset f (Link t) = Link $ f t
+mapAsset f (Img t) = Img $ f t
+mapAsset f (Script t) = Script $ f t
+mapAsset f (Style t) = Style $ f t
 
-isLink :: AssetType -> Bool
+fromAsset :: Asset -> Text
+fromAsset (Link t) = t
+fromAsset (Img t) = t
+fromAsset (Script t) = t
+fromAsset (Style t) = t
+
+isLink :: Asset -> Bool
 isLink (Link _) = True
 isLink _ = False
 
-isImg :: AssetType -> Bool
+isImg :: Asset -> Bool
 isImg (Img _) = True
 isImg _ = False
 
-isScript :: AssetType -> Bool
+isScript :: Asset -> Bool
 isScript (Script _) = True
 isScript _ = False
 
-isStyle :: AssetType -> Bool
+isStyle :: Asset -> Bool
 isStyle (Style _) = True
 isStyle _ = False
 
@@ -135,13 +164,20 @@ data URI = URI { uriProtocol :: Text
                }
                deriving (Show)
 
-type AssetMap = Map Text (Map AssetType Int)
+-- | URI path data structure
+data URIPath =
+    URIPath { uriPathPath :: Text
+            , uriPathGets :: Map Text Text
+            }
+            deriving (Eq, Show)
 
-mergeSubAssets :: Map AssetType Int -> Map AssetType Int
-               -> Map AssetType Int
+type AssetMap = Map Text (Map Asset Int)
+
+mergeSubAssets :: Map Asset Int -> Map Asset Int
+               -> Map Asset Int
 mergeSubAssets = Map.unionWith (+)
 
-insertAssets :: Text -> Map AssetType Int -> AssetMap -> AssetMap
+insertAssets :: Text -> Map Asset Int -> AssetMap -> AssetMap
 insertAssets = Map.insertWith mergeSubAssets
 
 -- | Crawler config data structure
@@ -176,8 +212,8 @@ linkQueue :: TQueue Text
 linkQueue = unsafePerformIO newTQueueIO
 
 -- | Quantity of finished threads
-threadDoneCache :: TVar (Vector ThreadId)
-threadDoneCache = unsafePerformIO $ newTVarIO Vec.empty
+threadDoneCache :: TVar Int
+threadDoneCache = unsafePerformIO $ newTVarIO 0
 
 -- }}}
 
@@ -261,7 +297,23 @@ uriParser = URI <$> protocol <* separator <*> userinfo <*> domain
     isUserInfo :: Char -> Bool
     isUserInfo c = isRegName c || c == ':'
 
--- | Parse a domain from an URL into a Maybe
+uriPathParser :: Atto.Parser URIPath
+uriPathParser = Atto.choice [ pathAndGets
+                            , URIPath <$> Atto.takeText <*> pure Map.empty
+                            ]
+  where
+    pathAndGets = do
+        path <- (Atto.takeWhile1 (/= '?') <|> pure "") <* Atto.char '?'
+        gets <- Atto.many' $ (,) <$> (Atto.takeWhile1 (/= '=') <* Atto.char '=')
+                                 <*> ((Atto.takeWhile1 (/= '&') <* Atto.char '&') <|> Atto.takeText)
+        return $ URIPath path (Map.fromList gets)
+
+-- | Parse a path string into a Maybe URIPath
+maybeParseURIPath :: Text -> Maybe URIPath
+maybeParseURIPath path = Atto.maybeResult
+                       $ Atto.parse uriPathParser path `Atto.feed` ""
+
+-- | Parse a URI string into a Maybe URI
 maybeParseURI :: Text -> Maybe URI
 maybeParseURI url = Atto.maybeResult
                   $ Atto.parse uriParser url `Atto.feed` ""
@@ -284,35 +336,36 @@ urlVerifyDomain domain = maybe False id
 -- | Download a webpage and return the parsed contents
 getPage :: Wreq.Session -> URL -> IO (Maybe Taggy.Node)
 getPage session url = do
-    request <- Wreq.getWith opts session url
+    request <- try @SomeException $ Wreq.getWith opts session url
 
     let body :: LazyText.Text
+        body = request ^. _Right
                         -- Get the response body
-        body = request ^. Wreq.responseBody
+                        . Wreq.responseBody
                         -- Lenient UTF-8 decoding to Text
                         . to (LazyText.decodeUtf8With Text.lenientDecode)
 
     return $ body ^? Taggy.htmlWith False
 
 -- | Parse HTML into contained asset links
-getPageAssets :: Taggy.Node -> IO Assets
-getPageAssets node = do
+getPageAssets :: Taggy.Node -> [Asset]
+getPageAssets !node =
         -- Find all <a> and return href attributes
-    let !links = catMaybes $ do
+    let links = map Link . catMaybes $ do
             node ^.. Taggy.allNamed (only "a") . Taggy.attr "href"
         -- Find all <img> and return src attributes
-        !imgs = catMaybes $ do
+        imgs = map Img . catMaybes $ do
             node ^.. Taggy.allNamed (only "img") . Taggy.attr "src"
         -- Find all <script> and return src attributes
-        !scripts = catMaybes $ do
+        scripts = map Script . catMaybes $ do
             node ^.. Taggy.allNamed (only "script") . Taggy.attr "src"
         -- Find all <link rel="stylesheet"> and return href attributes
-        !styles = catMaybes $ do
+        styles = map Style . catMaybes $ do
             node ^.. Taggy.allNamed (only "link")
                    . Taggy.attributed (ix "rel" . only "stylesheet")
                    . Taggy.attr "href"
 
-    return (links, imgs, scripts, styles)
+    in links <> imgs <> scripts <> styles
 
 
 noExceptions _ _ _ = Nothing
@@ -326,13 +379,14 @@ opts = Wreq.defaults { Wreq.checkStatus = Just noExceptions }
 getRobotRules :: Wreq.Session -> URL -> IO [RobotRules]
 getRobotRules session host = do
     let url = host </> "robots.txt"
-    request <- Wreq.getWith opts session url
+    request <- try @SomeException $ Wreq.getWith opts session url
 
     let body :: BL.ByteString
-        body = view Wreq.responseBody request
+        body = view (_Right . Wreq.responseBody) request
 
         textBody :: Text
-        textBody = Text.decodeUtf8With Text.lenientDecode (BL.toStrict body)
+        textBody = Text.decodeUtf8With Text.lenientDecode
+                                       (BL.toStrict body)
 
               -- Filter ignored lines
     let rules = filter (/= RobotIgnored)
@@ -343,80 +397,123 @@ getRobotRules session host = do
 
     return rules
 
-crawl :: Wreq.Session -> URL -> Config -> IO ()
-crawl session url config = do
-    let disallowedPaths = confDisPaths config
-        domain = confDomain config
-        assetCache = confAssetCache config
 
-    -- Download page
-    mnode <- getPage session url
+-- FIXME protocol links e.g.
+--          mailto:hello@test.com
+--          javascript:alert(1);
+parseURIC :: Text -> Conduit (AssetOf Link) IO (AssetOf Stripped)
+parseURIC !domain = awaitForever $ \asset -> do
+    let link = fromAsset $ coerce asset
 
-    let emptyAssets = ([], [], [], [])
-    -- Get page assets; return empty assets on getPage parse failure
-    assets <- maybe (pure emptyAssets) getPageAssets mnode
+    -- Parse link to Maybe URI
+    let muri = maybeParseURI link
+        -- Verify domain; assume no domain on parse failure
+        isDomain = maybe True id $ uriVerifyDomain domain <$> muri
 
-    let links = view _1 assets
-        imgs = view _2 assets
-        scripts = view _3 assets
-        styles = view _4 assets
+    when isDomain $ do
+            -- Remove fragment from link
+        let noFragmentLink = Text.takeWhile (/= '#') link
+            -- Use link as path instead of uriPath on parse failure
+            path = maybe noFragmentLink uriPath muri
+
+        yield $ AssetOf $ Link path
+
+removeDisallowedC :: [Text] -> Conduit (AssetOf Stripped) IO
+                                       (AssetOf Allowed)
+removeDisallowedC !disPaths = awaitForever $ \asset -> do
+    let path = fromAsset $ coerce asset
+
+    -- Filter disallowed paths
+    let isAllowed = not $ any (`Text.isPrefixOf` path) disPaths
+    when isAllowed $ yield $ AssetOf $ Link path
+
+removeVisitedC :: Conduit (AssetOf Allowed) IO (AssetOf Unvisited)
+removeVisitedC = awaitForever $ \asset -> do
+    let path = fromAsset $ coerce asset
 
     -- Get visited links from the cache
-    visitedLinks <- readTVarIO linkCache
+    visitedLinks <- liftIO $ readTVarIO linkCache
+    -- Filter visited paths
+    when (not $ Set.member path visitedLinks) $ do
+        yield $ AssetOf $ Link path
 
-    -- Remove duplicates
-    let uniqueLinks = List.nub links
+linkQueueC :: Sink (AssetOf Allowed) IO ()
+linkQueueC = do
+    removeVisitedC =$= CC.map (fromAsset . coerce)
+                   =$= sinkTQueue linkQueue
 
-    -- Sanitised paths
-    let sanitiseLinks allowVisited ls = do
-            -- For each link
-            !link <- ls
-            -- Parse link to Maybe URI
-            let !muri = maybeParseURI link
-            -- Verify domain; assume no domain on parse failure
-            guard $ maybe True id $ uriVerifyDomain domain <$> muri
-            -- Remove fragment from link
-            let !noFragmentLink = Text.takeWhile (/= '#') link
-            -- Use link as path instead of uriPath on parse failure
-            let !path = maybe noFragmentLink uriPath muri
-            -- Filter disallowed paths
-            guard . not $ any (`Text.isPrefixOf` path) disallowedPaths
-            -- Should we filter visited paths?
-            if not allowVisited
-            -- Filter visited paths
-            then guard . not $ Set.member path visitedLinks
-            -- Do nothing
-            else pure ()
-            return path
+pageAssetsP :: Wreq.Session -> URL
+            -> Producer IO Asset
+pageAssetsP session url = do
+    -- Download page
+    mnode <- liftIO $ getPage session url
+    -- Get page assets; return empty assets on getPage parse failure
+    CC.yieldMany $ maybe [] getPageAssets mnode
 
-    let !paths = sanitiseLinks False links
+pageLinksC :: Conduit Asset IO (AssetOf Link)
+pageLinksC = CC.mapWhile f
+  where
+    f a = bool Nothing (Just $ AssetOf a) (isLink a)
 
-    let pathsSet = Set.fromList paths
+-- FIXME ensure same domain on links
+-- FIXME strip GET parameters from URLs
+crawl :: Wreq.Session -> URL -> Config -> ConduitM _ _ _ _
+crawl session url config = do
+    let assetCache = confAssetCache config
 
-    tid <- myThreadId
+    let zipsC = [mergeAssetsC url assetCache, addLinksC config]
+    pageAssetsP session url =$= sequenceConduits zipsC
 
-    atomically $ do
-        let merger :: (Text -> AssetType) -> [Text] -> AssetMap
-                   -> AssetMap
-            merger c = insertAssets (Text.pack url)
-                     . List.foldl' (\m k -> Map.insertWith (+) (c k) 1 m)
-                                   Map.empty
-                     . sanitiseLinks True
+    return ()
+
+addLinksC :: Config -> Conduit Asset IO _
+addLinksC config = do
+    let disallowedPaths = confDisPaths config
+        domain = confDomain config
+
+    pageLinksC =$= parseURIC domain
+               =$= removeDisallowedC disallowedPaths
+               =$= sequenceConduits [ linkQueueC, linkCacheC ]
+
+    return ()
+
+-- ()
+finishWork :: Bool -> IO ()
+finishWork _ = do
+    -- This work finished
+    atomically $ modifyTVar' threadDoneCache (+1)
+
+-- Merge assets and ????
+mergeAssetsC :: URL -> _ -> Consumer Asset IO ()
+mergeAssetsC url assetCache = awaitForever $ \asset -> do
+    liftIO . atomically $ do
+        let merger :: Asset -> AssetMap -> AssetMap
+            merger = insertAssets (Text.pack url)
+                   . flip Map.singleton 1
+
         -- Add assets
-        modifyTVar' assetCache $ merger Link links
-        modifyTVar' assetCache $ merger Img imgs
-        modifyTVar' assetCache $ merger Script scripts
-        modifyTVar' assetCache $ merger Style styles
+        modifyTVar' assetCache $ merger asset
 
-    atomically $ do
+-- | Remove duplicate asset links
+removeDuplicatesC :: Set Asset
+                  -> Conduit (AssetOf _) IO (AssetOf _)
+removeDuplicatesC s = do
+    ma <- coerce <$> await
+
+    flip (maybe $ return ()) ma $ \a ->
+        if Set.member a s
+        then removeDuplicatesC s
+        else do
+            yield $ AssetOf a
+            removeDuplicatesC $ Set.insert a s
+
+-- | Add to the link cache
+linkCacheC :: Conduit (AssetOf Allowed) IO _
+linkCacheC = awaitForever $ \asset -> do
+    let path = fromAsset $ coerce asset
+    liftIO . atomically $ do
         -- Add paths that we've seen and will queue
-        modifyTVar' linkCache $ flip Set.union pathsSet
-
-        -- Queue unvisited links
-        mapM_ (writeTQueue linkQueue) paths
-
-        -- Work finished
-        modifyTVar' threadDoneCache (Vec.cons tid)
+        modifyTVar' linkCache $ Set.insert path
 
 
 -- | Re-use HTTP session to crawl
@@ -427,12 +524,13 @@ sessionHandler homepage config = do
         -- Read next link
         path <- atomically $ Text.unpack <$> readTQueue linkQueue
         -- Thread unfinished; remove done status
-        tid <- myThreadId
-        atomically $ modifyTVar' threadDoneCache (Vec.filter (/= tid))
+        atomically $ modifyTVar' threadDoneCache (max 0 . subtract 1)
         -- Safely combine homepage and path to a URL
         let url = homepage </> dropDrive path
         -- Crawl page for more links
-        crawl session url config
+        runConduit $ addCleanup finishWork $ crawl session url config
+        -- Progress
+        putChar 'o'
 
 -- }}}
 
@@ -456,7 +554,8 @@ writeSiteMap domain assetMap = do
 -- | Initialise the crawler with concurrent sessionHandlers
 initCrawler :: Int -> URL -> IO ()
 initCrawler threadCount url = do
-    putStrLn $ "Crawling \"" ++ url ++ "\"..."
+    putStrLn $ "Crawling \"" ++ url ++ "\" with "
+                             ++ show threadCount ++ " threads."
 
     -- Start time
     !startTime <- getCurrentTime
@@ -477,7 +576,7 @@ initCrawler threadCount url = do
             return $ Config disallowedPaths domain assetCache
 
         case configs of
-            (config:_) -> crawl session url config
+            (config:_) -> runConduit $ crawl session url config
             _ -> putStrLn "No threads."
 
         return configs
@@ -489,7 +588,7 @@ initCrawler threadCount url = do
     dones <- atomically $ do
         dones <- readTVar threadDoneCache
         -- All threads are currently done, we may be finished
-        if Vec.length dones == threadCount then do
+        if dones == threadCount then do
             isEmptyLinkQueue <- isEmptyTQueue linkQueue
             -- When the link queue is empty, we're done; otherwise retry
             unless isEmptyLinkQueue STM.retry
@@ -509,10 +608,10 @@ initCrawler threadCount url = do
     writeSiteMap domain allAssets
 
     -- Print basic stats
+    putChar '\n'
     putStrLn $ "Finished with \"" ++ url ++ "\"."
     putChar '\t'
-    putStr $ "Done threads: " ++ show (Vec.length dones)
-    putChar ' ' >> putStrLn (show dones)
+    putStrLn $ "Done threads: " ++ show dones
     putChar '\t'
     linkSet <- readTVarIO linkCache
     putStrLn $ "URLs crawled: " ++ show (Set.size linkSet)
@@ -542,6 +641,7 @@ initCrawler threadCount url = do
 
     -- Exit program
     exitSuccess
+    return ()
 
 initProgram :: Args -> IO ()
 initProgram args = do
