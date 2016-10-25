@@ -9,10 +9,10 @@ import Options.Applicative
 import System.IO (hSetBuffering, stdout, BufferMode(..))
 
 
-threadCount :: Parser Int
+threadCount :: Parser (Maybe Int)
 threadCount = option auto $ long "threads" <> short 't' <> metavar "N"
                                            <> help "Use N threads to download"
-                                           <> value 6 <> showDefault
+                                           <> value Nothing <> showDefault
 
 argsParser :: Parser Args
 argsParser = Args

@@ -18,6 +18,7 @@ library
   exposed-modules:     Lib
   build-depends:       base >= 4.7 && < 5
                      , attoparsec
+                     , blaze-html
                      , bytestring
                      , case-insensitive
                      , conduit
@@ -25,8 +26,10 @@ library
                      , containers
                      , deepseq
                      , filepath
-                     , lens
                      , errors
+                     , html-conduit
+                     , lens
+                     , random
                      , stm
                      , stm-conduit
                      , tagged
@@ -36,6 +39,7 @@ library
                      , time
                      , vector
                      , wreq
+                     , xml-lens
   default-language:    Haskell2010
 
 executable crawler
@@ -57,6 +61,7 @@ test-suite crawler-test
                      , tasty-hunit
                      , attoparsec
                      , containers
+                     , wreq
   ghc-options:         -threaded -rtsopts -with-rtsopts=-N
   default-language:    Haskell2010
 

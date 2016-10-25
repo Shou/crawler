@@ -6,8 +6,17 @@ import Lib
 import Test.Tasty
 import Test.Tasty.HUnit
 
+
+import Control.Monad (replicateM, forM_)
+import Control.Exception (evaluate)
+
 import qualified Data.Attoparsec.Text as Atto
 import qualified Data.Map.Strict as Map
+
+import qualified Network.Wreq.Session as Wreq
+
+
+gocardless = "https://gocardless.com/"
 
 
 parseFeed p t = Atto.parse p t `Atto.feed` ""
@@ -80,6 +89,10 @@ tests = defaultMain $ do
             , testCase "Invalid URL" . assert $
                 not $ urlVerifyDomain "example.com" "http://ex\"ample.com/"
             ]
+
+        , testGroup "Misc"
+            [
+            ]
         ]
 
 
@@ -91,5 +104,16 @@ main = do
         parseTest robotParser txt
     parseTest uriParser "http://example.com/"
 
-    tests
+    -- Taggy
+    tvars <- Wreq.withAPISession $ \s -> replicateM 100 $ async $ do
+        getPage s gocardless
+    pages <- mapM readAsync tvars
+    print . sum $ sum . fmap length . fmap getPageAssets <$> pages
+
+    -- XML
+    --xpages <- Wreq.withAPISession $ replicateM 100 . flip getPageXML gocardless
+    --print xpages
+    --print $ fmap getPageAssetsXML xpages
+
+    --tests
 

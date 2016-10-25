@@ -19,6 +19,7 @@ import Control.Concurrent (forkIO, myThreadId, ThreadId)
 import Control.Concurrent.MVar
 -- Non-blocking mutable shared state
 import Control.Concurrent.STM (atomically)
+import Control.Concurrent.STM.TMVar
 import Control.Concurrent.STM.TQueue
 import Control.Concurrent.STM.TVar
 -- Deep seq
@@ -29,10 +30,10 @@ import Control.Exception (try, SomeException)
 import Control.Lens
 -- Helpful control structure functions
 import Control.Monad ( forM, forM_, forever, guard, unless, join
-                     , when
+                     , when, replicateM_
                      )
 import Control.Monad.IO.Class (liftIO)
-import qualified Control.Monad.STM as STM (retry)
+import qualified Control.Monad.STM as STM
 
 -- Efficient textual parser
 import qualified Data.Attoparsec.Text as Atto
@@ -59,7 +60,7 @@ import qualified Data.List as List
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 -- Safe failures
-import Data.Maybe (catMaybes)
+import Data.Maybe (catMaybes, isJust)
 -- Monoids: appendable data structures
 import Data.Monoid ((<>))
 -- Sets
@@ -90,13 +91,24 @@ import qualified Network.Wreq.Types as Wreq
 
 -- Safe(r) paths; we use this for URL construction
 import System.FilePath.Posix ((</>), dropDrive)
+-- Program exit
+import System.Exit (exitSuccess)
 -- "Unsafe" IO functions; only used safely here!
 import System.IO.Unsafe (unsafePerformIO)
-import System.Exit (exitSuccess)
+-- Random values
+import System.Random (randomRIO)
 
--- XML parser
+-- Blaze HTML parser
+import qualified Text.Blaze.Html as Blaze
+-- HTML conduit
+import qualified Text.HTML.DOM as HTML
+-- String formatting/printing
+import Text.Printf (printf)
+-- Taggy HTML parser
 import qualified Text.Taggy as Taggy hiding (htmlWith)
 import qualified Text.Taggy.Lens as Taggy
+-- Lenses for 'XML'
+import qualified Text.XML.Lens as XML
 -- }}}
 
 
@@ -105,22 +117,24 @@ import qualified Text.Taggy.Lens as Taggy
 -- URLs are just Strings
 type URL = String
 
-data Asset = Link Text
-           | Img Text
-           | Script Text
-           | Style Text
-           deriving (Ord, Show, Generic, NFData)
+data Asset = Link !Text
+           | Img !Text
+           | Script !Text
+           | Style !Text
+           deriving (Eq, Ord, Show, Generic, NFData)
 
+-- | Tagged asset
 newtype AssetOf tag = AssetOf Asset
+
+-- | Data structure(s) size
+newtype Count a = Count Int
 
 data Link
 data Allowed
 data Unvisited
 data Stripped
 
--- | Ignore the constructor
-instance Eq Asset where
-    t1 == t2 = fromAsset t1 == fromAsset t2
+-- {{{ Asset utils
 
 mapAsset f (Link t) = Link $ f t
 mapAsset f (Img t) = Img $ f t
@@ -149,24 +163,26 @@ isStyle :: Asset -> Bool
 isStyle (Style _) = True
 isStyle _ = False
 
+-- }}}
+
 -- | Data structure for Robots.txt rules
-data RobotRules = RobotUserAgent Text
-                | RobotDisallowed Text
+data RobotRules = RobotUserAgent !Text
+                | RobotDisallowed !Text
                 | RobotIgnored
                 deriving (Show, Eq)
 
 -- | URI data structure
-data URI = URI { uriProtocol :: Text
-               , uriUserinfo :: Text
-               , uriDomain :: Text
-               , uriPort :: Text
-               , uriPath :: Text
+data URI = URI { uriProtocol :: !Text
+               , uriUserinfo :: !Text
+               , uriDomain :: !Text
+               , uriPort :: !Text
+               , uriPath :: !Text
                }
                deriving (Show)
 
 -- | URI path data structure
 data URIPath =
-    URIPath { uriPathPath :: Text
+    URIPath { uriPathPath :: !Text
             , uriPathGets :: Map Text Text
             }
             deriving (Eq, Show)
@@ -184,15 +200,21 @@ insertAssets = Map.insertWith mergeSubAssets
 data Config =
     Config { confDisPaths :: [Text]
            -- ^ Disallowed paths
-           , confDomain :: Text
+           , confDomain :: !Text
            -- ^ Website domain
            , confAssetCache :: TVar AssetMap
            -- ^ Static assets, and their associated visitor URLs and frequency
+           , confHomePage :: !URL
+           -- ^ Homepage URL String
+           , confSession :: !Wreq.Session
+           -- ^ Re-used Wreq session
+           , confThreads :: Maybe (Count ThreadId)
+           -- ^ Integer count of threads
            }
 
 -- Used in Main
 -- | Command line arguments data structure
-data Args = Args { argsThreads :: Int
+data Args = Args { argsThreads :: Maybe Int
                  -- ^ Amount of threads
                  , argsURLs :: [String]
                  -- ^ Websites to crawl
@@ -201,19 +223,71 @@ data Args = Args { argsThreads :: Int
 -- }}}
 
 
--- {{{ Shared state
+-- {{{ Concurrency and shared state
 
--- | Visited link cache
-linkCache :: TVar (Set Text)
-linkCache = unsafePerformIO $ newTVarIO Set.empty
+-- | Mirrored (visited) link cache
+linkMirror :: TMirror (Set Text)
+linkMirror = unsafePerformIO $ newTMirrorIO 10 Set.empty
 
 -- | Unvisited link queue
 linkQueue :: TQueue Text
 linkQueue = unsafePerformIO newTQueueIO
 
--- | Quantity of finished threads
-threadDoneCache :: TVar Int
-threadDoneCache = unsafePerformIO $ newTVarIO 0
+-- | Full list of asset cache TVars
+assetCachesVar :: TVar [TVar AssetMap]
+assetCachesVar = unsafePerformIO $ newTVarIO []
+
+-- | Terminal printer thread's queue
+printQueue :: TQueue String
+printQueue = unsafePerformIO newTQueueIO
+
+-- | Active threads counter
+activeThreadsVar :: TVar Int
+activeThreadsVar = unsafePerformIO $ newTVarIO 0
+
+-- | Total threads counter
+totalThreadsVar :: TVar Int
+totalThreadsVar = unsafePerformIO $ newTVarIO 0
+
+-- | Finished threads counter
+doneThreadsVar :: TVar Int
+doneThreadsVar = unsafePerformIO $ newTVarIO 0
+
+keyQuitVar :: TMVar ()
+keyQuitVar = unsafePerformIO newEmptyTMVarIO
+
+
+-- | Efficient concurrent atomic reads
+newtype TMirror a = TMirror { unMirror :: Vector (TVar a) }
+
+newTMirrorIO :: NFData a => Int -> a -> IO (TMirror a)
+newTMirrorIO len a = do
+    fmap TMirror . Vec.replicateM len $ newTVarIO (force a)
+
+readTMirrorIO :: NFData a => TMirror a -> IO a
+readTMirrorIO tm = do
+    n <- randomRIO (0, Vec.length (unMirror tm) - 1)
+    fmap force . readTVarIO $ unMirror tm Vec.! n
+
+modifyTMirrorIO :: TMirror a -> (a -> a) -> IO ()
+modifyTMirrorIO tm f = mapM_ (atomically . flip modifyTVar' f) vtm
+  where
+    vtm = unMirror tm
+
+
+-- | Terminal 'printer' front-end
+printer :: String -> IO ()
+printer = atomically . writeTQueue printQueue
+
+
+async io = do
+    t <- newEmptyTMVarIO
+    forkIO $ io >>= atomically . putTMVar t
+    return t
+
+readAsync = atomically . readTMVar
+
+asyncStore t io = atomically . modifyTVar' t . (:) =<< async io
 
 -- }}}
 
@@ -333,39 +407,63 @@ urlVerifyDomain domain = maybe False id
 
 -- {{{ Web utils
 
+-- FIXME Stack space overflow
+-- Text.Taggy.DOM.untilClosed.ts'',
+-- called from Text.Taggy.DOM.untilClosed,
+-- called from Text.Taggy.DOM.domify.(...),
+-- called from Text.Taggy.DOM.domify,
+-- called from Text.Taggy.Lens.htmlWith.parse,
+-- called from Text.Taggy.Lens.htmlWith,
+-- called from Lib.getPage
 -- | Download a webpage and return the parsed contents
 getPage :: Wreq.Session -> URL -> IO (Maybe Taggy.Node)
 getPage session url = do
+    !startTime <- getCurrentTime
     request <- try @SomeException $ Wreq.getWith opts session url
+    !endTime <- getCurrentTime
 
-    let body :: LazyText.Text
+    let byteBody = request ^. _Right . Wreq.responseBody
+        body :: LazyText.Text
         body = request ^. _Right
                         -- Get the response body
                         . Wreq.responseBody
                         -- Lenient UTF-8 decoding to Text
                         . to (LazyText.decodeUtf8With Text.lenientDecode)
 
+    printer $
+        printf "(%dkB, %s): %s\n"
+            (BL.length byteBody `div` 1000)
+            (show $ diffUTCTime endTime startTime)
+            url
+
     return $ body ^? Taggy.htmlWith False
 
+-- FIXME Stack space overflow
+-- Text.Taggy.Lens.element,
+-- called from Text.Taggy.Lens.elements,
+-- called from Text.Taggy.Lens.plate,
+-- called from Text.Taggy.Lens.allNamed,
+-- called from Lib.getPageAssets.imgs
 -- | Parse HTML into contained asset links
 getPageAssets :: Taggy.Node -> [Asset]
 getPageAssets !node =
         -- Find all <a> and return href attributes
-    let links = map Link . catMaybes $ do
-            node ^.. Taggy.allNamed (only "a") . Taggy.attr "href"
+    let links n = map Link . catMaybes $ do
+            n ^.. Taggy.allNamed (only "a") . Taggy.attr "href"
         -- Find all <img> and return src attributes
-        imgs = map Img . catMaybes $ do
-            node ^.. Taggy.allNamed (only "img") . Taggy.attr "src"
+        imgs n = map Img . catMaybes $ do
+            n ^.. Taggy.allNamed (only "img") . Taggy.attr "src"
         -- Find all <script> and return src attributes
-        scripts = map Script . catMaybes $ do
-            node ^.. Taggy.allNamed (only "script") . Taggy.attr "src"
+        scripts n = map Script . catMaybes $ do
+            n ^.. Taggy.allNamed (only "script") . Taggy.attr "src"
         -- Find all <link rel="stylesheet"> and return href attributes
-        styles = map Style . catMaybes $ do
-            node ^.. Taggy.allNamed (only "link")
-                   . Taggy.attributed (ix "rel" . only "stylesheet")
-                   . Taggy.attr "href"
+        styles n = map Style . catMaybes $ do
+            n ^.. Taggy.allNamed (only "link")
+                . Taggy.attributed (ix "rel" . only "stylesheet")
+                . Taggy.attr "href"
 
-    in links <> imgs <> scripts <> styles
+    -- Monoid function composition
+    in force $ (links <> imgs <> scripts <> styles) node
 
 
 noExceptions _ _ _ = Nothing
@@ -397,6 +495,8 @@ getRobotRules session host = do
 
     return rules
 
+-- }}}
+
 
 -- FIXME protocol links e.g.
 --          mailto:hello@test.com
@@ -427,24 +527,40 @@ removeDisallowedC !disPaths = awaitForever $ \asset -> do
     let isAllowed = not $ any (`Text.isPrefixOf` path) disPaths
     when isAllowed $ yield $ AssetOf $ Link path
 
-removeVisitedC :: Conduit (AssetOf Allowed) IO (AssetOf Unvisited)
-removeVisitedC = awaitForever $ \asset -> do
-    let path = fromAsset $ coerce asset
+-- | Add to the link cache
+addUnvisitedC :: Set Text
+               -> Conduit (AssetOf Allowed) IO (AssetOf Unvisited)
+addUnvisitedC unvisited = do
+    -- Get visited links from the mirrored cache
+    visited <- liftIO $ readTMirrorIO linkMirror
 
-    -- Get visited links from the cache
-    visitedLinks <- liftIO $ readTVarIO linkCache
-    -- Filter visited paths
-    when (not $ Set.member path visitedLinks) $ do
-        yield $ AssetOf $ Link path
+    ma <- await
+    case ma of
+        Just asset -> do
+            let !path = fromAsset $ coerce asset
 
-linkQueueC :: Sink (AssetOf Allowed) IO ()
+            -- Filter visited paths
+            if Set.notMember path (visited <> unvisited)
+
+            then do
+                yield (AssetOf $ Link path)
+                addUnvisitedC $ Set.insert path unvisited
+
+            else addUnvisitedC unvisited
+
+        Nothing -> liftIO $ do
+            -- Add unvisited links to mirrored link cache
+            modifyTMirrorIO linkMirror (Set.union unvisited)
+
+
+linkQueueC :: Sink (AssetOf Unvisited) IO ()
 linkQueueC = do
-    removeVisitedC =$= CC.map (fromAsset . coerce)
-                   =$= sinkTQueue linkQueue
+    CC.map (fromAsset . coerce) =$= sinkTQueue linkQueue
 
-pageAssetsP :: Wreq.Session -> URL
+pageAssetsP :: Config -> URL
             -> Producer IO Asset
-pageAssetsP session url = do
+pageAssetsP config url = do
+    let session = confSession config
     -- Download page
     mnode <- liftIO $ getPage session url
     -- Get page assets; return empty assets on getPage parse failure
@@ -457,84 +573,89 @@ pageLinksC = CC.mapWhile f
 
 -- FIXME ensure same domain on links
 -- FIXME strip GET parameters from URLs
-crawl :: Wreq.Session -> URL -> Config -> ConduitM _ _ _ _
-crawl session url config = do
+crawl :: Config -> URL -> Sink i IO ()
+crawl config url = do
     let assetCache = confAssetCache config
 
     let zipsC = [mergeAssetsC url assetCache, addLinksC config]
-    pageAssetsP session url =$= sequenceConduits zipsC
+    pageAssetsP config url =$= sequenceConduits zipsC
 
     return ()
 
-addLinksC :: Config -> Conduit Asset IO _
+-- |
+balanceC :: Sink (AssetOf Unvisited) IO ()
+balanceC = liftIO $ do
+    -- This thread now done and soon dead
+    atomically $ do
+        modifyTVar' activeThreadsVar (max 0 . subtract 1)
+        modifyTVar' doneThreadsVar (+1)
+
+addLinksC :: Config -> Sink Asset IO ()
 addLinksC config = do
     let disallowedPaths = confDisPaths config
         domain = confDomain config
 
+    let linkSequences = [linkQueueC, balanceC]
     pageLinksC =$= parseURIC domain
                =$= removeDisallowedC disallowedPaths
-               =$= sequenceConduits [ linkQueueC, linkCacheC ]
+               =$= addUnvisitedC mempty
+               =$= sequenceConduits linkSequences
 
     return ()
 
--- ()
-finishWork :: Bool -> IO ()
-finishWork _ = do
-    -- This work finished
-    atomically $ modifyTVar' threadDoneCache (+1)
-
 -- Merge assets and ????
-mergeAssetsC :: URL -> _ -> Consumer Asset IO ()
+mergeAssetsC :: URL -> TVar AssetMap -> Consumer Asset IO ()
 mergeAssetsC url assetCache = awaitForever $ \asset -> do
     liftIO . atomically $ do
         let merger :: Asset -> AssetMap -> AssetMap
             merger = insertAssets (Text.pack url)
                    . flip Map.singleton 1
+                   . force
 
         -- Add assets
         modifyTVar' assetCache $ merger asset
 
--- | Remove duplicate asset links
-removeDuplicatesC :: Set Asset
-                  -> Conduit (AssetOf _) IO (AssetOf _)
-removeDuplicatesC s = do
-    ma <- coerce <$> await
-
-    flip (maybe $ return ()) ma $ \a ->
-        if Set.member a s
-        then removeDuplicatesC s
-        else do
-            yield $ AssetOf a
-            removeDuplicatesC $ Set.insert a s
-
--- | Add to the link cache
-linkCacheC :: Conduit (AssetOf Allowed) IO _
-linkCacheC = awaitForever $ \asset -> do
-    let path = fromAsset $ coerce asset
-    liftIO . atomically $ do
-        -- Add paths that we've seen and will queue
-        modifyTVar' linkCache $ Set.insert path
-
 
 -- | Re-use HTTP session to crawl
-sessionHandler :: URL -> Config -> IO ()
-sessionHandler homepage config = do
-    -- No-cookie HTTP sessions
-    Wreq.withAPISession $ \session -> forever $ do
-        -- Read next link
-        path <- atomically $ Text.unpack <$> readTQueue linkQueue
-        -- Thread unfinished; remove done status
-        atomically $ modifyTVar' threadDoneCache (max 0 . subtract 1)
-        -- Safely combine homepage and path to a URL
-        let url = homepage </> dropDrive path
-        -- Crawl page for more links
-        runConduit $ addCleanup finishWork $ crawl session url config
-        -- Progress
-        putChar 'o'
+threadHandler :: Config -> IO ()
+threadHandler config = forever $ do
+    -- Read next link
+    path <- atomically $ Text.unpack <$> readTQueue linkQueue
+
+    -- Thread (still) active
+    (total, active) <- atomically $ do
+        total <- readTVar totalThreadsVar
+        active <- readTVar activeThreadsVar
+
+        let mayMaxThreads = coerce <$> confThreads config
+        -- Is maxThreads set?
+        case mayMaxThreads of
+            -- Too many threads? Retry
+            Just maxThreads -> unless (active < maxThreads) STM.retry
+            Nothing -> return ()
+
+        modifyTVar' totalThreadsVar (+1)
+        modifyTVar' activeThreadsVar (+1)
+
+        return (total + 1, active + 1)
+
+    printer $ printf "Threads: %d total, %d active\n" total active
+
+    -- Safely combine homepage and path to a URL
+    let url = confHomePage config </> dropDrive path
+    -- Crawl page for more links
+    forkIO $ runConduit $ crawl config url
 
 -- }}}
 
 
+-- FIXME Stack space overflow
+-- Data.Text.IO.writeFile,
+-- called from Data.Text.concat.ts',
+-- called from Data.Text.concat,
+-- called from Lib.writeSiteMap.format,
+-- called from Lib.writeSiteMap.showMap,
+-- called from Lib.writeSiteMap
 -- | Write the sitemap to a formatted text file
 writeSiteMap :: Text -> AssetMap -> IO ()
 writeSiteMap domain assetMap = do
@@ -551,97 +672,113 @@ writeSiteMap domain assetMap = do
     Text.writeFile (Text.unpack domain) showMap
 
 
+-- 'Blocks'/retries until we're done
+areWeDoneYet = atomically $ do
+    active <- readTVar activeThreadsVar
+    total <- readTVar totalThreadsVar
+    dones <- readTVar doneThreadsVar
+    -- All threads are currently done, we may be finished
+    if active == 0 && dones > 1 && dones == total then do
+        isEmptyLinkQueue <- isEmptyTQueue linkQueue
+        isKeyQuit <- isJust <$> tryReadTMVar keyQuitVar
+        -- When the link queue is empty, we're done; otherwise retry
+        unless (isEmptyLinkQueue || isKeyQuit) STM.retry
+
+    -- Only some threads are done; retry
+    else do
+        -- Manual keyboard quit?
+        isKeyQuit <- isJust <$> tryReadTMVar keyQuitVar
+        -- Keep retrying unless we're manually quitting
+        unless isKeyQuit STM.retry
+
+    return total
+
+
+-- TODO
 -- | Initialise the crawler with concurrent sessionHandlers
-initCrawler :: Int -> URL -> IO ()
-initCrawler threadCount url = do
-    putStrLn $ "Crawling \"" ++ url ++ "\" with "
-                             ++ show threadCount ++ " threads."
+initCrawler :: Maybe Int -> URL -> IO ()
+initCrawler mayThreadLimit url = Wreq.withAPISession $ \session -> do
+    printf "Crawling %s.\n" url
 
     -- Start time
     !startTime <- getCurrentTime
 
-    let domain = maybe "" uriDomain . maybeParseURI $ Text.pack url
-
     -- Get initial homepage links, and robots.txt disallowed paths
-    configs <- Wreq.withAPISession $ \session -> do
-        robotRules <- getRobotRules session url
+    robotRules <- getRobotRules session url
 
-        let !disallowedPaths = do
-                -- Filter non-RobotDisallowed
-                RobotDisallowed (!x) <- robotRules
-                return x
+    let disallowedPaths = do
+            -- Filter non-RobotDisallowed
+            RobotDisallowed x <- robotRules
+            return $! x
 
-        configs <- forM [1 .. threadCount] $ const $ do
-            assetCache <- newTVarIO Map.empty
-            return $ Config disallowedPaths domain assetCache
+    assetCache <- newTVarIO Map.empty
 
-        case configs of
-            (config:_) -> runConduit $ crawl session url config
-            _ -> putStrLn "No threads."
+    let domain = maybe "" uriDomain . maybeParseURI $ Text.pack url
+        threadCount = fmap coerce mayThreadLimit
+        config = Config disallowedPaths domain assetCache url session
+                        threadCount
 
-        return configs
+    -- Queue home page for downloading
+    atomically $ writeTQueue linkQueue ""
+    -- Run initial thread handler
+    forkIO $ threadHandler config
 
-    -- Run sessionHandlers in separate threads
-    forM_ configs $ forkIO . sessionHandler url
+    -- Terminal output thread
+    forkIO $ forever $ do
+        atomically (peekTQueue printQueue) >>= putStr
+        atomically $ readTQueue printQueue
 
-    -- Done threads list
-    dones <- atomically $ do
-        dones <- readTVar threadDoneCache
-        -- All threads are currently done, we may be finished
-        if dones == threadCount then do
-            isEmptyLinkQueue <- isEmptyTQueue linkQueue
-            -- When the link queue is empty, we're done; otherwise retry
-            unless isEmptyLinkQueue STM.retry
+    -- Keyboard input
+    forkIO $ forever $ do
+        input <- getLine
+        when (input == ":q") $ atomically $ putTMVar keyQuitVar ()
 
-        -- Only some threads are done; retry
-        else STM.retry
-
-        return dones
+    total <- areWeDoneYet
 
     !httpTime <- getCurrentTime
 
     -- Collect assets from threads' shared state
-    allAssets <- fmap (Map.unionsWith mergeSubAssets)
-              . forM configs $ readTVarIO . confAssetCache
+    allAssets <- atomically $ do
+        cacheVars <- readTVar assetCachesVar
+        assets <- forM cacheVars readTVar
+        return $ Map.unionsWith mergeSubAssets assets
 
     -- Write site map
-    writeSiteMap domain allAssets
+    --writeSiteMap domain allAssets
+
+    -- Synchronize with 'printer'
+    atomically $ do
+        b <- isEmptyTQueue printQueue
+        unless b STM.retry
+
+    linkSet <- readTMirrorIO linkMirror
 
     -- Print basic stats
-    putChar '\n'
-    putStrLn $ "Finished with \"" ++ url ++ "\"."
-    putChar '\t'
-    putStrLn $ "Done threads: " ++ show dones
-    putChar '\t'
-    linkSet <- readTVarIO linkCache
-    putStrLn $ "URLs crawled: " ++ show (Set.size linkSet)
-    putChar '\t'
+    printf "\nFinished with %s.\n" url
+    printf "\tDone threads: %d\n" total
+    printf "\tURLs crawled: %d\n" (Set.size linkSet)
     let links = filter isLink . List.nub . join . Map.elems
               $ Map.map Map.keys allAssets
-    putStrLn $ "Unique asset links: " ++ show (length links)
-    putChar '\t'
+    printf "\tUnique asset links: %d\n" (length links)
     let imgs = filter isImg . List.nub . join . Map.elems
              $ Map.map Map.keys allAssets
-    putStrLn $ "Unique asset imgs: " ++ show (length imgs)
-    putChar '\t'
+    printf "\tUnique asset imgs: %d\n" (length imgs)
     let scripts = filter isScript . List.nub . join . Map.elems
                 $ Map.map Map.keys allAssets
-    putStrLn $ "Unique asset scripts: " ++ show (length scripts)
-    putChar '\t'
+    printf "\tUnique asset scripts: %d\n" (length scripts)
     let styles = filter isStyle . List.nub . join . Map.elems
                $ Map.map Map.keys allAssets
-    putStrLn $ "Unique asset styles: " ++ show (length styles)
-    putChar '\t'
+    printf "\tUnique asset styles: %d\n" (length styles)
     endTime <- getCurrentTime
-    putStrLn $ "Time elapsed (HTTP): " ++ show (diffUTCTime httpTime startTime)
-    putChar '\t'
+    printf "\tTime elapsed (HTTP): %s\n"
+        (show $ diffUTCTime httpTime startTime)
     endTime <- getCurrentTime
-    putStrLn $ "Time elapsed (total): " ++ show (diffUTCTime endTime startTime)
-    putStrLn $ "Sitemap file: " ++ Text.unpack domain
+    printf "\tTime elapsed (total): %s\n"
+        (show $ diffUTCTime endTime startTime)
+    printf "Sitemap file: %s\n" domain
 
     -- Exit program
     exitSuccess
-    return ()
 
 initProgram :: Args -> IO ()
 initProgram args = do
