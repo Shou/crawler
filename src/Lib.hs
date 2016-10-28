@@ -237,7 +237,7 @@ printQueue = unsafePerformIO newTQueueIO
 
 -- | Terminal 'printer' front-end
 printer :: String -> IO ()
-printer = void . return --atomically . writeTQueue printQueue
+printer = atomically . writeTQueue printQueue
 
 
 -- | Futures/promises.
@@ -489,9 +489,7 @@ assetsToLinkSet config assetMap =
 sequenceDownlader :: Recursive |= Config -> AssetMap -> IO AssetMap
 sequenceDownlader config assetMap = do
     let !linkSet = assetsToLinkSet config assetMap
-    printer $ printf "Starting batch."
     !newAssetMap <- batchDownloader config linkSet
-    printer $ printf "Finished batch."
 
     let !unionAssetMap = Map.unionWith unionSubs newAssetMap assetMap
         !newLinkSet = assetsToLinkSet config newAssetMap
@@ -516,7 +514,6 @@ batchDownloader config linkSet = do
 
 downloader :: Config -> URL String -> IO AssetMap
 downloader config path = do
-    printer $ printf "Downloader."
     let !url = confHomePage config </> dropDrive path
 
     !mnode <- getPage (confSession config) url
@@ -552,7 +549,7 @@ writeSiteMap domain assetMap = do
 
     Text.writeFile (Text.unpack domain) showMap
 
-printStats url total assetMap startTime httpTime = do
+printStats url total linkSet assetMap startTime httpTime = do
     -- Print basic stats
     printf "\nFinished with %s.\n" url
     printf "\tTotal threads: %d\n" total
@@ -575,7 +572,6 @@ printStats url total assetMap startTime httpTime = do
     endTime <- getCurrentTime
     printf "\tTime elapsed (total): %s\n"
         (show $ diffUTCTime endTime startTime)
-    printf "Sitemap file: %s\n" domain
 
 initCrawler _ url = Wreq.withAPISession $ \session -> do
     printf "Crawling website %s\n" url
@@ -592,24 +588,31 @@ initCrawler _ url = Wreq.withAPISession $ \session -> do
 
         config = Config disallowedPaths domain url session
 
-    printer $ printf "Downloading initial asset map."
-    initAssetMap <- downloader config url
+    printf "Downloading initial asset map.\n"
+    initAssetMap <- downloader config ""
 
-    printer $ printf "Starting sequence downloader."
+    printf "Starting sequence downloader.\n"
     assetMap <- sequenceDownlader config initAssetMap
 
     -- Write site map
-    writeSiteMap ("assets_" <> domain <> ".txt") assetMap
+    let siteMapPath = "assets_" <> domain <> ".txt"
+    printf "Writing site map %s" siteMapPath
+    writeSiteMap siteMapPath assetMap
 
--- Terminal output thread
+
+-- | Consistently sequential terminal output thread
 printerThread = forkIO $ forever $ do
     atomically (peekTQueue printQueue) >>= putStr
     atomically $ readTQueue printQueue
+
 
 initProgram :: Args -> IO ()
 initProgram args = do
     let urls = argsURLs args
         threadCount = argsThreads args
+
+    printerThread
+
     -- For each website
     forM_ urls $ initCrawler threadCount
 
