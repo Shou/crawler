@@ -3,7 +3,8 @@
 
 {-# LANGUAGE OverloadedStrings, TypeApplications,
              PartialTypeSignatures, TupleSections, BangPatterns,
-             GADTs, RankNTypes, DeriveGeneric, DeriveAnyClass
+             GADTs, RankNTypes, DeriveGeneric, DeriveAnyClass,
+             TypeOperators
 #-}
 
 -- Module name
@@ -12,7 +13,7 @@ module Lib where
 
 -- {{{ Imports
 -- Helpful control structure function for failure/choice
-import Control.Applicative ((<|>))
+import Control.Applicative ((<|>), empty)
 -- Concurrency
 import Control.Concurrent (forkIO, myThreadId, ThreadId)
 -- Mutable shared state
@@ -30,10 +31,12 @@ import Control.Exception (try, SomeException)
 import Control.Lens
 -- Helpful control structure functions
 import Control.Monad ( forM, forM_, forever, guard, unless, join
-                     , when, replicateM_
+                     , when, replicateM_, void
                      )
 import Control.Monad.IO.Class (liftIO)
 import qualified Control.Monad.STM as STM
+-- Convenient type-level operators
+import Control.Type.Operator
 
 -- Efficient textual parser
 import qualified Data.Attoparsec.Text as Atto
@@ -60,7 +63,7 @@ import qualified Data.List as List
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 -- Safe failures
-import Data.Maybe (catMaybes, isJust)
+import Data.Maybe (catMaybes, isJust, fromJust)
 -- Monoids: appendable data structures
 import Data.Monoid ((<>))
 -- Sets
@@ -80,6 +83,7 @@ import Data.Time (getCurrentTime, diffUTCTime)
 -- Vector: efficient arrays
 import Data.Vector (Vector)
 import qualified Data.Vector as Vec
+import qualified Data.Vector.Lens as Lens
 
 -- Generic data
 import GHC.Generics (Generic)
@@ -115,7 +119,7 @@ import qualified Text.XML.Lens as XML
 -- {{{ Data and types
 
 -- URLs are just Strings
-type URL = String
+type URL a = a
 
 data Asset = Link !Text
            | Img !Text
@@ -123,16 +127,21 @@ data Asset = Link !Text
            | Style !Text
            deriving (Eq, Ord, Show, Generic, NFData)
 
--- | Tagged asset
-newtype AssetOf tag = AssetOf Asset
+type (s |- b) = Tagged s b
+infixr 9 |-
+type (b -| s) = Tagged s b
+infixr 9 -|
 
 -- | Data structure(s) size
-newtype Count a = Count Int
+data Size
 
+-- Asset tags
 data Link
 data Allowed
 data Unvisited
 data Stripped
+
+data Recursive
 
 -- {{{ Asset utils
 
@@ -178,23 +187,22 @@ data URI = URI { uriProtocol :: !Text
                , uriPort :: !Text
                , uriPath :: !Text
                }
-               deriving (Show)
+               deriving (Show, Generic, NFData)
 
 -- | URI path data structure
 data URIPath =
     URIPath { uriPathPath :: !Text
             , uriPathGets :: Map Text Text
             }
-            deriving (Eq, Show)
+            deriving (Eq, Show, Generic, NFData)
 
-type AssetMap = Map Text (Map Asset Int)
+type AssetMap = Map Text $ Map Asset Int
 
-mergeSubAssets :: Map Asset Int -> Map Asset Int
-               -> Map Asset Int
-mergeSubAssets = Map.unionWith (+)
+unionSubs :: Map Asset Int -> Map Asset Int -> Map Asset Int
+unionSubs = Map.unionWith (+)
 
 insertAssets :: Text -> Map Asset Int -> AssetMap -> AssetMap
-insertAssets = Map.insertWith mergeSubAssets
+insertAssets = Map.insertWith unionSubs
 
 -- | Crawler config data structure
 data Config =
@@ -202,14 +210,10 @@ data Config =
            -- ^ Disallowed paths
            , confDomain :: !Text
            -- ^ Website domain
-           , confAssetCache :: TVar AssetMap
-           -- ^ Static assets, and their associated visitor URLs and frequency
-           , confHomePage :: !URL
+           , confHomePage :: URL String
            -- ^ Homepage URL String
            , confSession :: !Wreq.Session
            -- ^ Re-used Wreq session
-           , confThreads :: Maybe (Count ThreadId)
-           -- ^ Integer count of threads
            }
 
 -- Used in Main
@@ -225,69 +229,23 @@ data Args = Args { argsThreads :: Maybe Int
 
 -- {{{ Concurrency and shared state
 
--- | Mirrored (visited) link cache
-linkMirror :: TMirror (Set Text)
-linkMirror = unsafePerformIO $ newTMirrorIO 10 Set.empty
-
--- | Unvisited link queue
-linkQueue :: TQueue Text
-linkQueue = unsafePerformIO newTQueueIO
-
--- | Full list of asset cache TVars
-assetCachesVar :: TVar [TVar AssetMap]
-assetCachesVar = unsafePerformIO $ newTVarIO []
-
 -- | Terminal printer thread's queue
 printQueue :: TQueue String
+{-# NOINLINE printQueue #-}
 printQueue = unsafePerformIO newTQueueIO
-
--- | Active threads counter
-activeThreadsVar :: TVar Int
-activeThreadsVar = unsafePerformIO $ newTVarIO 0
-
--- | Total threads counter
-totalThreadsVar :: TVar Int
-totalThreadsVar = unsafePerformIO $ newTVarIO 0
-
--- | Finished threads counter
-doneThreadsVar :: TVar Int
-doneThreadsVar = unsafePerformIO $ newTVarIO 0
-
-keyQuitVar :: TMVar ()
-keyQuitVar = unsafePerformIO newEmptyTMVarIO
-
-
--- | Efficient concurrent atomic reads
-newtype TMirror a = TMirror { unMirror :: Vector (TVar a) }
-
-newTMirrorIO :: NFData a => Int -> a -> IO (TMirror a)
-newTMirrorIO len a = do
-    fmap TMirror . Vec.replicateM len $ newTVarIO (force a)
-
-readTMirrorIO :: NFData a => TMirror a -> IO a
-readTMirrorIO tm = do
-    n <- randomRIO (0, Vec.length (unMirror tm) - 1)
-    fmap force . readTVarIO $ unMirror tm Vec.! n
-
-modifyTMirrorIO :: TMirror a -> (a -> a) -> IO ()
-modifyTMirrorIO tm f = mapM_ (atomically . flip modifyTVar' f) vtm
-  where
-    vtm = unMirror tm
 
 
 -- | Terminal 'printer' front-end
 printer :: String -> IO ()
-printer = atomically . writeTQueue printQueue
+printer = void . return --atomically . writeTQueue printQueue
 
 
+-- | Futures/promises.
+async :: IO a -> IO $ TMVar a
 async io = do
     t <- newEmptyTMVarIO
     forkIO $ io >>= atomically . putTMVar t
     return t
-
-readAsync = atomically . readTMVar
-
-asyncStore t io = atomically . modifyTVar' t . (:) =<< async io
 
 -- }}}
 
@@ -416,7 +374,7 @@ urlVerifyDomain domain = maybe False id
 -- called from Text.Taggy.Lens.htmlWith,
 -- called from Lib.getPage
 -- | Download a webpage and return the parsed contents
-getPage :: Wreq.Session -> URL -> IO (Maybe Taggy.Node)
+getPage :: Wreq.Session -> URL String -> IO $ Maybe Taggy.Node
 getPage session url = do
     !startTime <- getCurrentTime
     request <- try @SomeException $ Wreq.getWith opts session url
@@ -445,22 +403,34 @@ getPage session url = do
 -- called from Text.Taggy.Lens.allNamed,
 -- called from Lib.getPageAssets.imgs
 -- | Parse HTML into contained asset links
-getPageAssets :: Taggy.Node -> [Asset]
+getPageAssets :: Taggy.Node -> Vector Asset
 getPageAssets !node =
         -- Find all <a> and return href attributes
-    let links n = map Link . catMaybes $ do
-            n ^.. Taggy.allNamed (only "a") . Taggy.attr "href"
-        -- Find all <img> and return src attributes
-        imgs n = map Img . catMaybes $ do
-            n ^.. Taggy.allNamed (only "img") . Taggy.attr "src"
-        -- Find all <script> and return src attributes
-        scripts n = map Script . catMaybes $ do
-            n ^.. Taggy.allNamed (only "script") . Taggy.attr "src"
-        -- Find all <link rel="stylesheet"> and return href attributes
-        styles n = map Style . catMaybes $ do
-            n ^.. Taggy.allNamed (only "link")
-                . Taggy.attributed (ix "rel" . only "stylesheet")
+    let links :: Taggy.Node -> Vector Asset
+        links n = flip Lens.toVectorOf n
+                $ Taggy.allNamed (only "a")
                 . Taggy.attr "href"
+                . _Just
+                . to Link
+        -- Find all <img> and return src attributes
+        imgs n = flip Lens.toVectorOf n
+               $ Taggy.allNamed (only "img")
+               . Taggy.attr "src"
+               . _Just
+               . to Img
+        -- Find all <script> and return src attributes
+        scripts n = flip Lens.toVectorOf n
+                  $ Taggy.allNamed (only "script")
+                  . Taggy.attr "src"
+                  . _Just
+                  . to Script
+        -- Find all <link rel="stylesheet"> and return href attributes
+        styles n = flip Lens.toVectorOf n
+                 $ Taggy.allNamed (only "link")
+                 . Taggy.attributed (ix "rel" . only "stylesheet")
+                 . Taggy.attr "href"
+                 . _Just
+                 . to Style
 
     -- Monoid function composition
     in force $ (links <> imgs <> scripts <> styles) node
@@ -474,7 +444,7 @@ opts = Wreq.defaults { Wreq.checkStatus = Just noExceptions }
      & set (Wreq.header "User-Agent") ["milk-biscuit-teacake"]
 
 -- | Download and return robots.txt disallows
-getRobotRules :: Wreq.Session -> URL -> IO [RobotRules]
+getRobotRules :: Wreq.Session -> URL String -> IO [RobotRules]
 getRobotRules session host = do
     let url = host </> "robots.txt"
     request <- try @SomeException $ Wreq.getWith opts session url
@@ -498,153 +468,64 @@ getRobotRules session host = do
 -- }}}
 
 
--- FIXME protocol links e.g.
---          mailto:hello@test.com
---          javascript:alert(1);
-parseURIC :: Text -> Conduit (AssetOf Link) IO (AssetOf Stripped)
-parseURIC !domain = awaitForever $ \asset -> do
-    let link = fromAsset $ coerce asset
+-- {{{ Crawler
 
-    -- Parse link to Maybe URI
-    let muri = maybeParseURI link
-        -- Verify domain; assume no domain on parse failure
-        isDomain = maybe True id $ uriVerifyDomain domain <$> muri
-
-    when isDomain $ do
-            -- Remove fragment from link
-        let noFragmentLink = Text.takeWhile (/= '#') link
-            -- Use link as path instead of uriPath on parse failure
-            path = maybe noFragmentLink uriPath muri
-
-        yield $ AssetOf $ Link path
-
-removeDisallowedC :: [Text] -> Conduit (AssetOf Stripped) IO
-                                       (AssetOf Allowed)
-removeDisallowedC !disPaths = awaitForever $ \asset -> do
-    let path = fromAsset $ coerce asset
-
-    -- Filter disallowed paths
-    let isAllowed = not $ any (`Text.isPrefixOf` path) disPaths
-    when isAllowed $ yield $ AssetOf $ Link path
-
--- | Add to the link cache
-addUnvisitedC :: Set Text
-               -> Conduit (AssetOf Allowed) IO (AssetOf Unvisited)
-addUnvisitedC unvisited = do
-    -- Get visited links from the mirrored cache
-    visited <- liftIO $ readTMirrorIO linkMirror
-
-    ma <- await
-    case ma of
-        Just asset -> do
-            let !path = fromAsset $ coerce asset
-
-            -- Filter visited paths
-            if Set.notMember path (visited <> unvisited)
-
-            then do
-                yield (AssetOf $ Link path)
-                addUnvisitedC $ Set.insert path unvisited
-
-            else addUnvisitedC unvisited
-
-        Nothing -> liftIO $ do
-            -- Add unvisited links to mirrored link cache
-            modifyTMirrorIO linkMirror (Set.union unvisited)
-
-
-linkQueueC :: Sink (AssetOf Unvisited) IO ()
-linkQueueC = do
-    CC.map (fromAsset . coerce) =$= sinkTQueue linkQueue
-
-pageAssetsP :: Config -> URL
-            -> Producer IO Asset
-pageAssetsP config url = do
-    let session = confSession config
-    -- Download page
-    mnode <- liftIO $ getPage session url
-    -- Get page assets; return empty assets on getPage parse failure
-    CC.yieldMany $ maybe [] getPageAssets mnode
-
-pageLinksC :: Conduit Asset IO (AssetOf Link)
-pageLinksC = CC.mapWhile f
-  where
-    f a = bool Nothing (Just $ AssetOf a) (isLink a)
-
--- FIXME ensure same domain on links
--- FIXME strip GET parameters from URLs
-crawl :: Config -> URL -> Sink i IO ()
-crawl config url = do
-    let assetCache = confAssetCache config
-
-    let zipsC = [mergeAssetsC url assetCache, addLinksC config]
-    pageAssetsP config url =$= sequenceConduits zipsC
-
-    return ()
-
--- |
-balanceC :: Sink (AssetOf Unvisited) IO ()
-balanceC = liftIO $ do
-    -- This thread now done and soon dead
-    atomically $ do
-        modifyTVar' activeThreadsVar (max 0 . subtract 1)
-        modifyTVar' doneThreadsVar (+1)
-
-addLinksC :: Config -> Sink Asset IO ()
-addLinksC config = do
-    let disallowedPaths = confDisPaths config
+assetsToLinkSet :: Config -> AssetMap -> Set $ URL Text
+assetsToLinkSet config assetMap =
+    let links = map fromAsset . filter isLink . join . fmap Map.keys
+              $ Map.elems assetMap
         domain = confDomain config
+        disPath = confDisPaths config
+    in Set.fromList $ do
+        link <- links
+        let muri = maybeParseURI link
+            isDomain = maybe True id $ uriVerifyDomain domain <$> muri
+        guard isDomain
+        let path = maybe "" uriPath muri
+            isAllowed = not $ any (`Text.isPrefixOf` path) disPath
+        guard isAllowed
+        return link
 
-    let linkSequences = [linkQueueC, balanceC]
-    pageLinksC =$= parseURIC domain
-               =$= removeDisallowedC disallowedPaths
-               =$= addUnvisitedC mempty
-               =$= sequenceConduits linkSequences
+sequenceDownlader :: Recursive |= Config -> AssetMap -> IO AssetMap
+sequenceDownlader config assetMap = do
+    let !linkSet = assetsToLinkSet config assetMap
+    printer $ printf "Starting batch."
+    !newAssetMap <- batchDownloader config linkSet
+    printer $ printf "Finished batch."
 
-    return ()
+    let !unionAssetMap = Map.unionWith unionSubs newAssetMap assetMap
+        !newLinkSet = assetsToLinkSet config newAssetMap
+        -- Newly introduced uncrawled links
+        !diffLinkSet = Set.difference newLinkSet linkSet
 
--- Merge assets and ????
-mergeAssetsC :: URL -> TVar AssetMap -> Consumer Asset IO ()
-mergeAssetsC url assetCache = awaitForever $ \asset -> do
-    liftIO . atomically $ do
-        let merger :: Asset -> AssetMap -> AssetMap
-            merger = insertAssets (Text.pack url)
-                   . flip Map.singleton 1
-                   . force
+    -- Any more URLs to crawl?
+    if Set.null diffLinkSet
+    -- Finish up
+    then return unionAssetMap
+    -- Keep downloading batches
+    else sequenceDownlader config unionAssetMap
 
-        -- Add assets
-        modifyTVar' assetCache $ merger asset
+batchDownloader :: Config -> Set $ URL Text -> IO AssetMap
+batchDownloader config linkSet = do
+    futures <- forM (Set.toList linkSet) $ async
+                                         . downloader config
+                                         . Text.unpack
 
+    -- Returns when all futures have been read
+    Map.unionsWith unionSubs <$> mapM (atomically . readTMVar) futures
 
--- | Re-use HTTP session to crawl
-threadHandler :: Config -> IO ()
-threadHandler config = forever $ do
-    -- Read next link
-    path <- atomically $ Text.unpack <$> readTQueue linkQueue
+downloader :: Config -> URL String -> IO AssetMap
+downloader config path = do
+    printer $ printf "Downloader."
+    let !url = confHomePage config </> dropDrive path
 
-    -- Thread (still) active
-    (total, active) <- atomically $ do
-        total <- readTVar totalThreadsVar
-        active <- readTVar activeThreadsVar
+    !mnode <- getPage (confSession config) url
 
-        let mayMaxThreads = coerce <$> confThreads config
-        -- Is maxThreads set?
-        case mayMaxThreads of
-            -- Too many threads? Retry
-            Just maxThreads -> unless (active < maxThreads) STM.retry
-            Nothing -> return ()
+    let !assetMap = Map.singleton (Text.pack url) $ Map.fromList $ map (,1)
+                  $ Vec.toList $ maybe Vec.empty getPageAssets mnode
 
-        modifyTVar' totalThreadsVar (+1)
-        modifyTVar' activeThreadsVar (+1)
+    return assetMap
 
-        return (total + 1, active + 1)
-
-    printer $ printf "Threads: %d total, %d active\n" total active
-
-    -- Safely combine homepage and path to a URL
-    let url = confHomePage config </> dropDrive path
-    -- Crawl page for more links
-    forkIO $ runConduit $ crawl config url
 
 -- }}}
 
@@ -671,103 +552,22 @@ writeSiteMap domain assetMap = do
 
     Text.writeFile (Text.unpack domain) showMap
 
-
--- 'Blocks'/retries until we're done
-areWeDoneYet = atomically $ do
-    active <- readTVar activeThreadsVar
-    total <- readTVar totalThreadsVar
-    dones <- readTVar doneThreadsVar
-    -- All threads are currently done, we may be finished
-    if active == 0 && dones > 1 && dones == total then do
-        isEmptyLinkQueue <- isEmptyTQueue linkQueue
-        isKeyQuit <- isJust <$> tryReadTMVar keyQuitVar
-        -- When the link queue is empty, we're done; otherwise retry
-        unless (isEmptyLinkQueue || isKeyQuit) STM.retry
-
-    -- Only some threads are done; retry
-    else do
-        -- Manual keyboard quit?
-        isKeyQuit <- isJust <$> tryReadTMVar keyQuitVar
-        -- Keep retrying unless we're manually quitting
-        unless isKeyQuit STM.retry
-
-    return total
-
-
--- TODO
--- | Initialise the crawler with concurrent sessionHandlers
-initCrawler :: Maybe Int -> URL -> IO ()
-initCrawler mayThreadLimit url = Wreq.withAPISession $ \session -> do
-    printf "Crawling %s.\n" url
-
-    -- Start time
-    !startTime <- getCurrentTime
-
-    -- Get initial homepage links, and robots.txt disallowed paths
-    robotRules <- getRobotRules session url
-
-    let disallowedPaths = do
-            -- Filter non-RobotDisallowed
-            RobotDisallowed x <- robotRules
-            return $! x
-
-    assetCache <- newTVarIO Map.empty
-
-    let domain = maybe "" uriDomain . maybeParseURI $ Text.pack url
-        threadCount = fmap coerce mayThreadLimit
-        config = Config disallowedPaths domain assetCache url session
-                        threadCount
-
-    -- Queue home page for downloading
-    atomically $ writeTQueue linkQueue ""
-    -- Run initial thread handler
-    forkIO $ threadHandler config
-
-    -- Terminal output thread
-    forkIO $ forever $ do
-        atomically (peekTQueue printQueue) >>= putStr
-        atomically $ readTQueue printQueue
-
-    -- Keyboard input
-    forkIO $ forever $ do
-        input <- getLine
-        when (input == ":q") $ atomically $ putTMVar keyQuitVar ()
-
-    total <- areWeDoneYet
-
-    !httpTime <- getCurrentTime
-
-    -- Collect assets from threads' shared state
-    allAssets <- atomically $ do
-        cacheVars <- readTVar assetCachesVar
-        assets <- forM cacheVars readTVar
-        return $ Map.unionsWith mergeSubAssets assets
-
-    -- Write site map
-    --writeSiteMap domain allAssets
-
-    -- Synchronize with 'printer'
-    atomically $ do
-        b <- isEmptyTQueue printQueue
-        unless b STM.retry
-
-    linkSet <- readTMirrorIO linkMirror
-
+printStats url total assetMap startTime httpTime = do
     -- Print basic stats
     printf "\nFinished with %s.\n" url
-    printf "\tDone threads: %d\n" total
+    printf "\tTotal threads: %d\n" total
     printf "\tURLs crawled: %d\n" (Set.size linkSet)
     let links = filter isLink . List.nub . join . Map.elems
-              $ Map.map Map.keys allAssets
+              $ Map.map Map.keys assetMap
     printf "\tUnique asset links: %d\n" (length links)
     let imgs = filter isImg . List.nub . join . Map.elems
-             $ Map.map Map.keys allAssets
+             $ Map.map Map.keys assetMap
     printf "\tUnique asset imgs: %d\n" (length imgs)
     let scripts = filter isScript . List.nub . join . Map.elems
-                $ Map.map Map.keys allAssets
+                $ Map.map Map.keys assetMap
     printf "\tUnique asset scripts: %d\n" (length scripts)
     let styles = filter isStyle . List.nub . join . Map.elems
-               $ Map.map Map.keys allAssets
+               $ Map.map Map.keys assetMap
     printf "\tUnique asset styles: %d\n" (length styles)
     endTime <- getCurrentTime
     printf "\tTime elapsed (HTTP): %s\n"
@@ -777,8 +577,34 @@ initCrawler mayThreadLimit url = Wreq.withAPISession $ \session -> do
         (show $ diffUTCTime endTime startTime)
     printf "Sitemap file: %s\n" domain
 
-    -- Exit program
-    exitSuccess
+initCrawler _ url = Wreq.withAPISession $ \session -> do
+    printf "Crawling website %s\n" url
+
+    robotRules <- getRobotRules session url
+    let disallowedPaths = do
+            -- Filter non-RobotDisallowed
+            RobotDisallowed x <- robotRules
+            return $! x
+
+    putStr "Disallowed paths: " >> print disallowedPaths
+
+    let domain = maybe "" uriDomain . maybeParseURI $ Text.pack url
+
+        config = Config disallowedPaths domain url session
+
+    printer $ printf "Downloading initial asset map."
+    initAssetMap <- downloader config url
+
+    printer $ printf "Starting sequence downloader."
+    assetMap <- sequenceDownlader config initAssetMap
+
+    -- Write site map
+    writeSiteMap ("assets_" <> domain <> ".txt") assetMap
+
+-- Terminal output thread
+printerThread = forkIO $ forever $ do
+    atomically (peekTQueue printQueue) >>= putStr
+    atomically $ readTQueue printQueue
 
 initProgram :: Args -> IO ()
 initProgram args = do

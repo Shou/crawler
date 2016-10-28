@@ -37,6 +37,7 @@ library
                      , taggy-lens
                      , text
                      , time
+                     , type-operators
                      , vector
                      , wreq
                      , xml-lens
@@ -49,6 +50,7 @@ executable crawler
   build-depends:       base
                      , crawler
                      , optparse-applicative
+                     , safe
   default-language:    Haskell2010
 
 test-suite crawler-test
