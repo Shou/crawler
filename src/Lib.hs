@@ -229,6 +229,17 @@ data Args = Args { argsThreads :: Maybe Int
 
 -- {{{ Concurrency and shared state
 
+-- | Download counter.
+counterVar :: TVar Int
+{-# NOINLINE counterVar #-}
+counterVar = unsafePerformIO $ newTVarIO 0
+
+succCounter = atomically $ do
+    n <- readTVar counterVar
+    writeTVar counterVar (n+1)
+    return (n+1)
+
+
 -- | Terminal printer thread's queue
 printQueue :: TQueue String
 {-# NOINLINE printQueue #-}
@@ -471,7 +482,7 @@ getRobotRules session host = do
 -- {{{ Crawler
 
 assetsToLinkSet :: Config -> AssetMap -> Set $ URL Text
-assetsToLinkSet config assetMap =
+assetsToLinkSet config !assetMap =
     let links = map fromAsset . filter isLink . join . fmap Map.keys
               $ Map.elems assetMap
         domain = confDomain config
@@ -481,27 +492,35 @@ assetsToLinkSet config assetMap =
         let muri = maybeParseURI link
             isDomain = maybe True id $ uriVerifyDomain domain <$> muri
         guard isDomain
-        let path = maybe "" uriPath muri
+        -- TODO FIXME this is a DUMB hacc
+        let !noFragmentLink = Text.takeWhile (/= '#') link
+        let path = maybe noFragmentLink uriPath muri
             isAllowed = not $ any (`Text.isPrefixOf` path) disPath
         guard isAllowed
-        return link
+        return path
 
-sequenceDownlader :: Recursive |= Config -> AssetMap -> IO AssetMap
-sequenceDownlader config assetMap = do
-    let !linkSet = assetsToLinkSet config assetMap
+-- XXX has potential for optimization
+sequenceDownlader :: Config -> AssetMap -> Set $ URL Text -> IO AssetMap
+sequenceDownlader !config !assetMap !linkSet = do
     !newAssetMap <- batchDownloader config linkSet
 
+        -- Accumulated asset map
     let !unionAssetMap = Map.unionWith unionSubs newAssetMap assetMap
+        -- Accumulated link set
+        !unionLinkSet = Set.fromList $ Map.keys unionAssetMap
+        -- Link set from newly visited pages
         !newLinkSet = assetsToLinkSet config newAssetMap
         -- Newly introduced uncrawled links
-        !diffLinkSet = Set.difference newLinkSet linkSet
+        !diffLinkSet = Set.difference newLinkSet unionLinkSet
+
+    print $ Set.size diffLinkSet
 
     -- Any more URLs to crawl?
     if Set.null diffLinkSet
     -- Finish up
     then return unionAssetMap
     -- Keep downloading batches
-    else sequenceDownlader config unionAssetMap
+    else sequenceDownlader config unionAssetMap diffLinkSet
 
 batchDownloader :: Config -> Set $ URL Text -> IO AssetMap
 batchDownloader config linkSet = do
@@ -518,8 +537,11 @@ downloader config path = do
 
     !mnode <- getPage (confSession config) url
 
-    let !assetMap = Map.singleton (Text.pack url) $ Map.fromList $ map (,1)
-                  $ Vec.toList $ maybe Vec.empty getPageAssets mnode
+    let !assetMap = Map.singleton (Text.pack path) $ Map.fromList
+                  $ map (,1) $ Vec.toList
+                  $ maybe Vec.empty getPageAssets mnode
+
+    --succCounter >>= printer . printf "Counter %d\n"
 
     return assetMap
 
@@ -536,7 +558,7 @@ downloader config path = do
 -- called from Lib.writeSiteMap
 -- | Write the sitemap to a formatted text file
 writeSiteMap :: Text -> AssetMap -> IO ()
-writeSiteMap domain assetMap = do
+writeSiteMap filename assetMap = do
     let formatSub prevText asset freq = mconcat
             [ prevText, "\tFrequency: ", Text.pack (show freq)
             , ";\tAsset: ", Text.pack $ show asset, "\n"
@@ -547,7 +569,7 @@ writeSiteMap domain assetMap = do
         showSubMap = Map.foldlWithKey formatSub ""
         showMap = Map.foldlWithKey format "" assetMap
 
-    Text.writeFile (Text.unpack domain) showMap
+    Text.writeFile (Text.unpack filename) showMap
 
 printStats url total linkSet assetMap startTime httpTime = do
     -- Print basic stats
@@ -591,8 +613,10 @@ initCrawler _ url = Wreq.withAPISession $ \session -> do
     printf "Downloading initial asset map.\n"
     initAssetMap <- downloader config ""
 
+    let linkSet = assetsToLinkSet config initAssetMap
+
     printf "Starting sequence downloader.\n"
-    assetMap <- sequenceDownlader config initAssetMap
+    assetMap <- sequenceDownlader config initAssetMap linkSet
 
     -- Write site map
     let siteMapPath = "assets_" <> domain <> ".txt"
