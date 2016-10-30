@@ -481,6 +481,7 @@ getRobotRules session host = do
 
 -- {{{ Crawler
 
+-- |
 assetsToLinkSet :: Config -> AssetMap -> Set $ URL Text
 assetsToLinkSet config !assetMap =
     let links = map fromAsset . filter isLink . join . fmap Map.keys
@@ -571,10 +572,12 @@ writeSiteMap filename assetMap = do
 
     Text.writeFile (Text.unpack filename) showMap
 
-printStats url total linkSet assetMap startTime httpTime = do
+printStats :: _ -> String -> _
+printStats url total assetMap startTime httpTime = do
     -- Print basic stats
     printf "\nFinished with %s.\n" url
-    printf "\tTotal threads: %d\n" total
+    printf "\tTotal threads: %s\n" total
+    let linkSet = Set.fromList $ Map.keys assetMap
     printf "\tURLs crawled: %d\n" (Set.size linkSet)
     let links = filter isLink . List.nub . join . Map.elems
               $ Map.map Map.keys assetMap
@@ -591,12 +594,12 @@ printStats url total linkSet assetMap startTime httpTime = do
     endTime <- getCurrentTime
     printf "\tTime elapsed (HTTP): %s\n"
         (show $ diffUTCTime httpTime startTime)
-    endTime <- getCurrentTime
     printf "\tTime elapsed (total): %s\n"
         (show $ diffUTCTime endTime startTime)
 
 initCrawler _ url = Wreq.withAPISession $ \session -> do
     printf "Crawling website %s\n" url
+    startTime <- getCurrentTime
 
     robotRules <- getRobotRules session url
     let disallowedPaths = do
@@ -611,12 +614,14 @@ initCrawler _ url = Wreq.withAPISession $ \session -> do
         config = Config disallowedPaths domain url session
 
     printf "Downloading initial asset map.\n"
-    initAssetMap <- downloader config ""
+    initAssetMap <- downloader config "/"
 
     let linkSet = assetsToLinkSet config initAssetMap
 
     printf "Starting sequence downloader.\n"
     assetMap <- sequenceDownlader config initAssetMap linkSet
+
+    printStats url "Infinity" assetMap startTime startTime
 
     -- Write site map
     let siteMapPath = "assets_" <> domain <> ".txt"
